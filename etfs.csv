@@ -1,0 +1,23 @@
+Ticker,Name,Asset Class,Description,Risk Level
+VTI,Vanguard Total Stock Market ETF,Equity,Broad US market exposure,Low
+SPY,SPDR S&P 500 ETF Trust,Equity,Tracks S&P 500 Index,Medium
+VOO,Vanguard S&P 500 ETF,Equity,Low-cost exposure to the S&P 500,Medium
+QQQ,Invesco QQQ Trust,Equity,Tracks Nasdaq-100 Index,High
+IWM,iShares Russell 2000 ETF,Equity,Small-cap US companies,High
+VEA,Vanguard FTSE Developed Markets ETF,Equity,International developed markets,Medium
+VWO,Vanguard FTSE Emerging Markets ETF,Equity,Emerging markets exposure,High
+IEFA,iShares Core MSCI EAFE ETF,Equity,Developed international markets,Medium
+XLK,Technology Select Sector SPDR Fund,Equity,US tech sector,High
+XLV,Health Care Select Sector SPDR Fund,Equity,US healthcare sector,Medium
+XLF,Financial Select Sector SPDR Fund,Equity,US financial sector,Medium
+VYM,Vanguard High Dividend Yield ETF,Equity,High dividend large-cap US stocks,Low
+SCHD,Schwab US Dividend Equity ETF,Equity,US dividend stocks,Low
+BND,Vanguard Total Bond Market ETF,Bonds,Diversified bond exposure,Low
+AGG,iShares Core US Aggregate Bond ETF,Bonds,Broad bond exposure,Low
+TLT,iShares 20+ Year Treasury Bond ETF,Bonds,Long-term US Treasuries,Medium
+LQD,iShares iBoxx $ Investment Grade Corp Bond ETF,Bonds,Corporate bonds,Medium
+BNDX,Vanguard Total International Bond ETF,Bonds,Global bonds excluding US,Medium
+SHV,iShares Short Treasury Bond ETF,Cash,Short-term US Treasury bonds,Very Low
+VGSH,Vanguard Short-Term Treasury ETF,Cash,1-3 year US Treasury bonds,Very Low
+GLD,SPDR Gold Shares,Alternative,Gold exposure,Medium
+TIP,iShares TIPS Bond ETF,Bonds,Inflation-protected US Treasury bonds,Low
