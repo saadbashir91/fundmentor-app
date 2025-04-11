@@ -133,7 +133,6 @@ with tab1:
                 & (etf_df["Risk Level"].isin(risk_filters[risk]))
             ].copy()
 
-            # Apply goal preference filter (if applicable)
             if goal in goal_preferences:
                 try:
                     filtered = goal_preferences[goal](filtered)
@@ -163,3 +162,36 @@ with tab1:
                                  "Annual Dividend Yield %": "Yield",
                                  "Total Assets": "AUM"
                              }), use_container_width=True)
+
+# ---- ETF Screener Tab ----
+with tab2:
+    st.subheader("ETF Screener")
+    st.caption("Search and sort from the full ETF list below. Filter by asset class, risk level, or search by keyword.")
+
+    asset_class_options = ["All"] + sorted(etf_df["Simplified Asset Class"].dropna().unique())
+    selected_asset_class = st.selectbox("Filter by Asset Class", asset_class_options)
+
+    risk_options = ["All", "Low", "Medium", "High"]
+    selected_risk = st.selectbox("Filter by Risk Level", risk_options)
+
+    keyword = st.text_input("Search by Symbol or Name")
+
+    screener_df = etf_df.copy()
+    if selected_asset_class != "All":
+        screener_df = screener_df[screener_df["Simplified Asset Class"].str.lower() == selected_asset_class.lower()]
+    if selected_risk != "All":
+        screener_df = screener_df[screener_df["Risk Level"] == selected_risk]
+    if keyword:
+        screener_df = screener_df[
+            screener_df["ETF Name"].str.contains(keyword, case=False, na=False) |
+            screener_df["Symbol"].str.contains(keyword, case=False, na=False)
+        ]
+
+    screener_df_display = screener_df[["Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", "Total Assets", "Risk Level"]].rename(columns={
+        "1 Year": "1Y Return",
+        "ER": "Expense Ratio",
+        "Annual Dividend Yield %": "Yield",
+        "Total Assets": "AUM"
+    })
+
+    st.dataframe(screener_df_display, use_container_width=True)
