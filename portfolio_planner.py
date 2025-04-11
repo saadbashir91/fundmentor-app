@@ -1,17 +1,7 @@
 import streamlit as st
 import pandas as pd
-import yfinance as yf
 
 st.set_page_config(page_title="FundMentor", layout="wide")
-
-# ---- ETF Universe ----
-etf_list = [
-    "VTI", "SPY", "QQQ", "IWM", "VEA", "VWO", "IEFA", "XLK", "XLV", "XLF",
-    "VYM", "SCHD", "BND", "AGG", "TLT", "LQD", "BNDX", "SHV", "VGSH", "GLD",
-    "TIP", "ARKK", "XLE", "XLY", "XLC", "XLI", "XLB", "XLRE", "XLU", "XBI",
-    "HYG", "SHY", "MUB", "ICSH", "GOVT", "SCHO", "IAU", "USFR", "SPAB", "BSV",
-    "SPDW", "VIG", "FDN", "IGSB", "VCSH", "EMB", "BIL", "JPST", "SPSB", "GDX"
-]
 
 # ---- Allocation Matrix ----
 allocation_matrix = {
@@ -26,8 +16,76 @@ allocation_matrix = {
     ("Wealth Growth", "Growth"): {"Equity": 85, "Bonds": 10, "Cash": 5},
 }
 
+# ---- Risk Filter Mapping ----
+risk_filters = {
+    "Conservative": ["Low"],
+    "Balanced": ["Low", "Medium"],
+    "Growth": ["Medium", "High"]
+}
+
+# ---- Goal Preference Filter (Updated Thresholds) ----
+goal_preferences = {
+    "Retirement": lambda df: df[pd.to_numeric(df["Annual Dividend Yield %"].str.replace("%", ""), errors="coerce") > 1.8],
+    "Income": lambda df: df[pd.to_numeric(df["Annual Dividend Yield %"].str.replace("%", ""), errors="coerce") > 2.2],
+    "Wealth Growth": lambda df: df[pd.to_numeric(df["1 Year"].str.replace("%", ""), errors="coerce") > 6]
+}
+
+# ---- Risk Classification Function ----
+def classify_risk(row):
+    def parse_percentage(val):
+        try:
+            return float(str(val).replace('%', '').replace(',', '').strip())
+        except:
+            return None
+
+    def parse_aum(val):
+        try:
+            return float(str(val).replace('$', '').replace('B', '').replace(',', '').strip())
+        except:
+            return None
+
+    ret = parse_percentage(row.get("1 Year", ""))
+    er = parse_percentage(row.get("ER", ""))
+    yield_pct = parse_percentage(row.get("Annual Dividend Yield %", ""))
+    aum = parse_aum(row.get("Total Assets", ""))
+
+    score = 0
+
+    if ret is not None:
+        if ret > 12: score += 2
+        elif ret < 4: score -= 2
+
+    if er is not None:
+        if er > 0.6: score += 2
+        elif er < 0.1: score -= 2
+
+    if yield_pct is not None:
+        if yield_pct < 1: score += 1
+        elif yield_pct > 2.5: score -= 1
+
+    if aum is not None:
+        if aum < 1: score += 2
+        elif aum > 10: score -= 1
+
+    if score <= -2:
+        return "Low"
+    elif score <= 2:
+        return "Medium"
+    else:
+        return "High"
+
 # ---- App Tabs ----
-tab1, tab2 = st.tabs(["Portfolio Builder", "Live ETF Screener"])
+tab1, tab2 = st.tabs(["Portfolio Builder", "ETF Screener"])
+
+# ---- Load ETF Data ----
+@st.cache_data
+def load_etf_data():
+    df = pd.read_csv("etf_asset_class_tagged.csv")
+    df = df.rename(columns={"Total Assets ": "Total Assets"})
+    df["Risk Level"] = df.apply(classify_risk, axis=1)
+    return df
+
+etf_df = load_etf_data()
 
 # ---- Sidebar: Client Profile ----
 with st.sidebar:
@@ -47,7 +105,6 @@ with tab1:
                 f"**Horizon:** {horizon} years | **Investment Amount:** ${amount:,.2f}")
 
     st.markdown("### Strategic Asset Allocation")
-
     allocation = allocation_matrix.get((goal, risk), {"Equity": 50, "Bonds": 40, "Cash": 10})
     allocation_text = {
         "Equity": "Growth-oriented exposure to drive portfolio appreciation.",
@@ -64,100 +121,45 @@ with tab1:
 
     tab_eq, tab_bd, tab_cash = st.tabs(["Equity", "Bonds", "Cash"])
     tab_map = {"Equity": tab_eq, "Bonds": tab_bd, "Cash": tab_cash}
+    asset_mapping = {"Equity": "equity", "Bonds": "bond", "Cash": "cash"}
 
     for asset_class, tab in tab_map.items():
         with tab:
             st.markdown(f"### Top {asset_class} ETFs")
-            recommendations = []
-            for ticker in etf_list:
+            class_key = asset_mapping[asset_class]
+
+            filtered = etf_df[
+                (etf_df["Simplified Asset Class"].str.lower() == class_key)
+                & (etf_df["Risk Level"].isin(risk_filters[risk]))
+            ].copy()
+
+            # Apply goal preference filter (if applicable)
+            if goal in goal_preferences:
                 try:
-                    etf = yf.Ticker(ticker)
-                    info = etf.info
-                    hist = etf.history(period="1y")
-                    if hist.empty:
-                        continue
-
-                    name = info.get("shortName", "N/A")
-                    summary = info.get("longBusinessSummary", "N/A")
-                    category = info.get("category", "").lower()
-                    price = info.get("regularMarketPrice", None)
-                    aum = info.get("totalAssets", None)
-                    expense = info.get("expenseRatio", None)
-                    yield_pct = info.get("yield", None)
-
-                    first = hist["Close"].iloc[0]
-                    last = hist["Close"].iloc[-1]
-                    ret = ((last - first) / first) * 100
-
-                    # --- Mapping to asset class ---
-                    if asset_class == "Equity" and "equity" not in category and "stock" not in category:
-                        continue
-                    if asset_class == "Bonds" and "bond" not in category:
-                        continue
-                    if asset_class == "Cash" and "short" not in category and "treasury" not in category:
-                        continue
-
-                    recommendations.append({
-                        "Ticker": ticker,
-                        "Name": name,
-                        "Price": f"${price:.2f}" if price else "N/A",
-                        "1Y Return": f"{ret:.1f}%",
-                        "Expense Ratio": f"{expense * 100:.2f}%" if expense else "N/A",
-                        "Yield": f"{yield_pct * 100:.2f}%" if yield_pct else "N/A",
-                        "AUM": f"${aum / 1e9:.1f}B" if aum else "N/A",
-                        "Rating": "★★★★☆" if ret > 5 else "★★★☆☆",
-                        "Suitability": "Growth-Oriented" if ret > 5 else "Income-Oriented",
-                        "Summary": summary[:300] + "..." if summary else "N/A",
-                        "Why": "Strong performance and cost efficiency." if ret > 5 else "Stable performer suitable for core allocation."
-                    })
+                    filtered = goal_preferences[goal](filtered)
                 except:
-                    continue
+                    pass
 
-            top_etfs = sorted(recommendations, key=lambda x: float(x["1Y Return"].replace('%','')), reverse=True)[:10]
+            st.caption(f"{len(filtered)} ETFs match the filters for this asset class and goal.")
 
-            for etf in top_etfs:
+            filtered["1 Year"] = pd.to_numeric(filtered["1 Year"].astype(str).str.replace("%", ""), errors="coerce")
+            top_etfs = filtered.sort_values(by="1 Year", ascending=False).head(10)
+
+            for _, row in top_etfs.iterrows():
                 st.markdown(f"""
                 <div style='background:#f9f9f9; padding:15px; border-radius:10px; border:1px solid #ddd; margin-bottom:15px;'>
-                    <b><a href='https://finance.yahoo.com/quote/{etf["Ticker"]}' target='_blank'>{etf["Ticker"]}: {etf["Name"]}</a></b> – {etf["Price"]}<br>
-                    <b>1Y Return:</b> {etf["1Y Return"]} &nbsp; <b>Expense Ratio:</b> {etf["Expense Ratio"]} &nbsp; <b>Yield:</b> {etf["Yield"]}<br>
-                    <b>AUM:</b> {etf["AUM"]} &nbsp; <b>Rating:</b> {etf["Rating"]} &nbsp; <b>Suitability:</b> {etf["Suitability"]}<br>
-                    <div style='font-size:13px; margin-top:6px;'>{etf["Summary"]}</div>
-                    <div style='margin-top:6px;'><b>Why this ETF?</b> {etf["Why"]}</div>
+                    <b><a href='https://finance.yahoo.com/quote/{row['Symbol']}' target='_blank'>{row['Symbol']}: {row['ETF Name']}</a></b><br>
+                    <b>1Y Return:</b> {row['1 Year']} &nbsp; <b>Expense Ratio:</b> {row['ER']} &nbsp; <b>Yield:</b> {row['Annual Dividend Yield %']}<br>
+                    <b>AUM:</b> {row['Total Assets']} &nbsp; <b>Risk Level:</b> {row['Risk Level']}<br>
                 </div>
                 """, unsafe_allow_html=True)
 
-            if recommendations:
-                df = pd.DataFrame(recommendations)
+            if not top_etfs.empty:
                 st.markdown("**ETF Comparison Table**")
-                st.dataframe(df[["Ticker", "Name", "Price", "1Y Return", "Expense Ratio", "Yield", "AUM", "Rating", "Suitability"]], use_container_width=True)
-
-# ---- Live ETF Screener ----
-with tab2:
-    st.subheader("Live ETF Screener")
-    st.caption("A dynamic list of 50+ ETFs pulled from Yahoo Finance. Sorted by 1Y return.")
-    results = []
-
-    for ticker in etf_list:
-        try:
-            etf = yf.Ticker(ticker)
-            info = etf.info
-            hist = etf.history(period="1y")
-            if hist.empty: continue
-            price = info.get("regularMarketPrice", None)
-            first = hist["Close"].iloc[0]
-            last = hist["Close"].iloc[-1]
-            ret = ((last - first) / first) * 100
-            results.append({
-                "Ticker": ticker,
-                "Name": info.get("shortName", "N/A"),
-                "Price": f"${price:.2f}" if price else "N/A",
-                "1Y Return": f"{ret:.1f}%",
-                "Expense Ratio": f"{info.get('expenseRatio', 0) * 100:.2f}%" if info.get("expenseRatio") else "N/A",
-                "Yield": f"{info.get('yield', 0) * 100:.2f}%" if info.get("yield") else "N/A",
-                "AUM": f"${info.get('totalAssets', 0) / 1e9:.1f}B" if info.get("totalAssets") else "N/A"
-            })
-        except:
-            continue
-
-    df = pd.DataFrame(results).sort_values(by="1Y Return", ascending=False)
-    st.dataframe(df, use_container_width=True)
+                st.dataframe(top_etfs[["Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", "Total Assets", "Risk Level"]]
+                             .rename(columns={
+                                 "1 Year": "1Y Return",
+                                 "ER": "Expense Ratio",
+                                 "Annual Dividend Yield %": "Yield",
+                                 "Total Assets": "AUM"
+                             }), use_container_width=True)
