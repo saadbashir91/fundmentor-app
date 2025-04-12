@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="FundMentor", layout="wide")
 
@@ -23,7 +24,7 @@ risk_filters = {
     "Growth": ["Medium", "High"]
 }
 
-# ---- Goal Preference Filter (Updated Thresholds) ----
+# ---- Goal Preference Filter ----
 goal_preferences = {
     "Retirement": lambda df: df[pd.to_numeric(df["Annual Dividend Yield %"].str.replace("%", ""), errors="coerce") > 1.8],
     "Income": lambda df: df[pd.to_numeric(df["Annual Dividend Yield %"].str.replace("%", ""), errors="coerce") > 2.2],
@@ -50,7 +51,6 @@ def classify_risk(row):
     aum = parse_aum(row.get("Total Assets", ""))
 
     score = 0
-
     if ret is not None:
         if ret > 12: score += 2
         elif ret < 4: score -= 2
@@ -74,9 +74,6 @@ def classify_risk(row):
     else:
         return "High"
 
-# ---- App Tabs ----
-tab1, tab2 = st.tabs(["Portfolio Builder", "ETF Screener"])
-
 # ---- Load ETF Data ----
 @st.cache_data
 def load_etf_data():
@@ -86,6 +83,9 @@ def load_etf_data():
     return df
 
 etf_df = load_etf_data()
+
+# ---- App Tabs ----
+tab1, tab2, tab3 = st.tabs(["Portfolio Builder", "ETF Screener", "Portfolio Analyzer"])
 
 # ---- Sidebar: Client Profile ----
 with st.sidebar:
@@ -98,11 +98,10 @@ with st.sidebar:
     client_name = st.text_input("Client Name")
     notes = st.text_area("Meeting Notes")
 
-# ---- Portfolio Builder ----
+# ---- Portfolio Builder Tab ----
 with tab1:
     st.subheader("Personalized Investment Plan")
-    st.markdown(f"**Client:** {client_name or 'N/A'} | **Goal:** {goal} | **Risk Profile:** {risk} | "
-                f"**Horizon:** {horizon} years | **Investment Amount:** ${amount:,.2f}")
+    st.markdown(f"**Client:** {client_name or 'N/A'} | **Goal:** {goal} | **Risk Profile:** {risk} | Horizon: {horizon} years | Investment Amount: ${amount:,.2f}")
 
     st.markdown("### Strategic Asset Allocation")
     allocation = allocation_matrix.get((goal, risk), {"Equity": 50, "Bonds": 40, "Cash": 10})
@@ -166,14 +165,10 @@ with tab1:
 # ---- ETF Screener Tab ----
 with tab2:
     st.subheader("ETF Screener")
-    st.caption("Search and sort from the full ETF list below. Filter by asset class, risk level, or search by keyword.")
-
     asset_class_options = ["All"] + sorted(etf_df["Simplified Asset Class"].dropna().unique())
     selected_asset_class = st.selectbox("Filter by Asset Class", asset_class_options)
-
     risk_options = ["All", "Low", "Medium", "High"]
     selected_risk = st.selectbox("Filter by Risk Level", risk_options)
-
     keyword = st.text_input("Search by Symbol or Name")
 
     screener_df = etf_df.copy()
@@ -195,3 +190,73 @@ with tab2:
     })
 
     st.dataframe(screener_df_display, use_container_width=True)
+
+# ---- Portfolio Analyzer Tab ----
+with tab3:
+    st.subheader("Portfolio Analyzer")
+    uploaded_file = st.file_uploader("Upload Portfolio CSV", type=["csv"])
+
+    if uploaded_file is not None:
+        user_df = pd.read_csv(uploaded_file)
+
+        if "Symbol" not in user_df.columns:
+            st.error("Your file must have a 'Symbol' column with ETF tickers.")
+        else:
+            portfolio_df = etf_df[etf_df["Symbol"].isin(user_df["Symbol"])]
+            portfolio_df["Risk Level"] = portfolio_df.apply(classify_risk, axis=1)
+
+            if portfolio_df.empty:
+                st.warning("No matching ETFs found in the dataset.")
+            else:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("#### Asset Class Allocation")
+                    asset_counts = portfolio_df["Simplified Asset Class"].value_counts()
+                    fig1, ax1 = plt.subplots(figsize=(3.5, 3.5))
+                    ax1.pie(asset_counts, labels=asset_counts.index, autopct="%1.0f%%", startangle=140, wedgeprops=dict(width=0.4))
+                    st.pyplot(fig1)
+
+                with col2:
+                    st.markdown("#### Risk Level Distribution")
+                    risk_counts = portfolio_df["Risk Level"].value_counts()
+                    fig2, ax2 = plt.subplots(figsize=(3.5, 3.5))
+                    ax2.pie(risk_counts, labels=risk_counts.index, autopct="%1.0f%%", startangle=140, wedgeprops=dict(width=0.4))
+                    st.pyplot(fig2)
+
+                # ---- Portfolio Scorecard ----
+                st.markdown("### Portfolio Scorecard")
+                col3, col4, col5, col6 = st.columns(4)
+
+                def parse_metric(col):
+                    if col == "Total Assets":
+                        return pd.to_numeric(
+                            portfolio_df[col].astype(str)
+                            .str.replace("$", "", regex=False)
+                            .str.replace("B", "", regex=False)
+                            .str.replace(",", "", regex=False),
+                            errors="coerce"
+                        )
+                    else:
+                        return pd.to_numeric(portfolio_df[col].astype(str).str.replace("%", "", regex=False), errors="coerce")
+
+                with col3:
+                    st.metric("Average 1Y Return", f"{parse_metric('1 Year').mean():.2f}%")
+                with col4:
+                    st.metric("Avg. Expense Ratio", f"{parse_metric('ER').mean():.2f}%")
+                with col5:
+                    st.metric("Avg. Dividend Yield", f"{parse_metric('Annual Dividend Yield %').mean():.2f}%")
+                with col6:
+                    st.metric("Avg. AUM (B)", f"{parse_metric('Total Assets').mean():.2f}B")
+
+                # ---- Portfolio Table ----
+                st.markdown("### Portfolio Breakdown")
+                st.dataframe(portfolio_df[[
+                    "Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %",
+                    "Total Assets", "Simplified Asset Class", "Risk Level"
+                ]].rename(columns={
+                    "1 Year": "1Y Return",
+                    "ER": "Expense Ratio",
+                    "Annual Dividend Yield %": "Yield",
+                    "Total Assets": "AUM",
+                    "Simplified Asset Class": "Asset Class"
+                }), use_container_width=True)
