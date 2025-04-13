@@ -111,7 +111,7 @@ with st.sidebar:
         else:
             return "Growth"
 
-    if st.button("🎯 Take Risk Questionnaire"):
+    if st.button("Take Risk Questionnaire"):
         st.session_state["show_risk_quiz"] = True
         st.session_state["quiz_step"] = 1
         st.session_state["quiz_score"] = 0
@@ -142,7 +142,7 @@ with st.sidebar:
 
         elif st.session_state["quiz_step"] == 4:
             final_profile = get_risk_profile(st.session_state["quiz_score"])
-            st.success(f"🎯 Based on your answers, your suggested risk profile is: **{final_profile}**")
+            st.success(f"Based on your answers, your suggested risk profile is: **{final_profile}**")
 
             if st.button("Use this profile"):
                 st.session_state["Risk Tolerance"] = final_profile
@@ -394,7 +394,7 @@ with tab4:
                     use_container_width=True
                 )
             
-                # 🔄 Suggested Trade Actions
+                # Suggested Trade Actions
                 def suggest_action(row):
                     drift = row["Drift (%)"]
                     asset_class = row["Simplified Asset Class"].capitalize()
@@ -411,7 +411,7 @@ with tab4:
                 action_df = display_df.dropna(subset=["Suggested Action"])
 
                 if not action_df.empty:
-                    st.markdown("###Suggested Trade Actions")
+                    st.markdown("Suggested Trade Actions")
                     st.dataframe(
                         action_df[["Simplified Asset Class", "Weight (%)", "Recommended (%)", "Drift (%)", "Suggested Action"]],
                         use_container_width=True
