@@ -393,6 +393,29 @@ with tab4:
                     display_df.style.applymap(highlight_drift, subset=["Drift (%)"]),
                     use_container_width=True
                 )
+            
+                # 🔄 Suggested Trade Actions
+                def suggest_action(row):
+                    drift = row["Drift (%)"]
+                    asset_class = row["Simplified Asset Class"].capitalize()
+    
+                    if drift > 5:
+                        return f"🔻 Reduce exposure to {asset_class} by {drift:.2f}%"
+                    elif drift < -5:
+                        return f"🔺 Increase exposure to {asset_class} by {abs(drift):.2f}%"
+                    else:
+                        return None
+
+
+                display_df["Suggested Action"] = display_df.apply(suggest_action, axis=1)
+                action_df = display_df.dropna(subset=["Suggested Action"])
+
+                if not action_df.empty:
+                    st.markdown("###Suggested Trade Actions")
+                    st.dataframe(
+                        action_df[["Simplified Asset Class", "Weight (%)", "Recommended (%)", "Drift (%)", "Suggested Action"]],
+                        use_container_width=True
+                )
 
                 # Normalize asset class to lowercase
                 merged["Simplified Asset Class"] = merged["Simplified Asset Class"].str.lower()
