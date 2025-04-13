@@ -350,7 +350,7 @@ with tab3:
                 st.dataframe(merged[existing_cols].rename(columns=display_renames), use_container_width=True)
 
 with tab4:
-    st.subheader("🔄 Rebalancing Checker")
+    st.subheader("Rebalancing Checker")
     st.caption("Upload your portfolio CSV (with Symbol, Quantity, and Price). We’ll auto-match ETF metadata and calculate drift from your personalized FundMentor recommendation.")
 
     rebal_file = st.file_uploader("Upload Current Portfolio (CSV with 'Symbol', 'Quantity', and 'Price')", type=["csv"], key="rebal_upload")
