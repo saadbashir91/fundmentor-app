@@ -79,10 +79,64 @@ def classify_risk(row):
 def load_etf_data():
     df = pd.read_csv("etf_asset_class_tagged.csv")
     df = df.rename(columns={"Total Assets ": "Total Assets"})
+
+    # --- Mixed ETF Classification Logic ---
+    mixed_keywords = ["balanced", "growth", "portfolio", "income", "allocation", "target", "vgro", "xgro", "zbla", "zbal", "xbal", "vbla", "vbal"]
+    df["is_potential_mixed"] = df["ETF Name"].str.lower().apply(
+        lambda name: any(keyword in name for keyword in mixed_keywords)
+    )
+    df["Simplified Asset Class"] = df.apply(
+        lambda row: "Mixed" if row["is_potential_mixed"] and 
+        (pd.isna(row["Simplified Asset Class"]) or str(row["Simplified Asset Class"]).strip().lower() in ["", "other"]) 
+        else row["Simplified Asset Class"],
+        axis=1
+    )
+
     df["Risk Level"] = df.apply(classify_risk, axis=1)
     return df
 
 etf_df = load_etf_data()
+
+# ---- Multi-Factor ETF Scoring Engine ----
+def normalize(series):
+    return (series - series.min()) / (series.max() - series.min())
+
+def get_factor_weights(goal):
+    if goal == "Wealth Growth":
+        return {"1Y": 0.30, "ER": 0.20, "AUM": 0.10, "Yield": 0.10, "TaxEff": 0.30}
+    elif goal == "Retirement":
+        return {"1Y": 0.20, "ER": 0.20, "AUM": 0.10, "Yield": 0.20, "TaxEff": 0.30}
+    elif goal == "Income":
+        return {"1Y": 0.10, "ER": 0.20, "AUM": 0.10, "Yield": 0.30, "TaxEff": 0.30}
+    else:
+        return {"1Y": 0.20, "ER": 0.20, "AUM": 0.10, "Yield": 0.20, "TaxEff": 0.30}
+
+def rank_etfs(df, goal):
+    df = df.copy()
+
+    # Clean and convert
+    df["1Y_clean"] = pd.to_numeric(df["1 Year"].astype(str).str.replace("%", ""), errors="coerce")
+    df["ER_clean"] = pd.to_numeric(df["ER"].astype(str).str.replace("%", ""), errors="coerce")
+    df["Yield_clean"] = pd.to_numeric(df["Annual Dividend Yield %"].astype(str).str.replace("%", ""), errors="coerce")
+    df["AUM_clean"] = pd.to_numeric(df["Total Assets"].astype(str).str.replace("$", "").str.replace("B", "").str.replace(",", ""), errors="coerce")
+    df["TaxEff_clean"] = 1 / (df["Yield_clean"] + df["ER_clean"])
+
+    # Normalize
+    df["1Y_score"] = normalize(df["1Y_clean"])
+    df["ER_score"] = 1 - normalize(df["ER_clean"])
+    df["AUM_score"] = normalize(df["AUM_clean"])
+    df["Yield_score"] = normalize(df["Yield_clean"])
+    df["TaxEff_score"] = normalize(df["TaxEff_clean"])
+
+    weights = get_factor_weights(goal)
+    df["Final Score"] = (
+        weights["1Y"] * df["1Y_score"] +
+        weights["ER"] * df["ER_score"] +
+        weights["AUM"] * df["AUM_score"] +
+        weights["Yield"] * df["Yield_score"] +
+        weights["TaxEff"] * df["TaxEff_score"]
+    )
+    return df
 
 # ---- App Tabs ----
 tab1, tab2, tab3, tab4 = st.tabs(["Portfolio Builder", "ETF Screener", "Portfolio Analyzer", "Rebalancing Checker"])
@@ -153,6 +207,61 @@ with st.sidebar:
 
             st.markdown("This result is a guide and should be discussed further with an advisor if unsure.")
 
+    # ---- Country & Use Context ----
+    st.header("Context")
+
+    country = st.selectbox("Select Country", ["Canada", "USA"])
+
+    # Dynamic options based on country
+    use_context_options = {
+        "Canada": ["TFSA", "RRSP", "RESP", "Non-Registered", "Institutional"],
+        "USA": ["Roth IRA", "401(k)", "Traditional IRA", "Taxable", "Institutional"]
+    }
+    use_context = st.selectbox("Use Context", use_context_options[country])
+
+    # Rules engine
+    context_rules = {
+        ("Canada", "TFSA"): {
+            "avoid_us_dividends": True,
+            "favor_growth": True,
+            "note": "Recommendations adjusted for TFSA — tax-efficient growth prioritized."
+        },
+        ("Canada", "RRSP"): {
+            "avoid_us_dividends": False,
+            "favor_growth": True,
+            "note": "Optimized for RRSP — U.S. ETFs allowed without withholding tax."
+        },
+        ("Canada", "Non-Registered"): {
+            "avoid_us_dividends": True,
+            "favor_tax_efficiency": True,
+            "note": "Tax-efficient ETFs prioritized for non-registered account."
+        },
+        ("USA", "Roth IRA"): {
+            "avoid_dividends": True,
+            "favor_growth": True,
+            "note": "Roth IRA: growth-focused with tax-free appreciation."
+        },
+        ("USA", "401(k)"): {
+            "favor_low_fee": True,
+            "note": "401(k): cost efficiency and retirement growth prioritized."
+        },
+        ("USA", "Taxable"): {
+            "favor_tax_efficiency": True,
+            "note": "Taxable account: ETFs ranked for tax-efficient income."
+        },
+        # Fallback
+        ("Canada", "Institutional"): {"note": "Institutional use — no retail tax adjustments applied."},
+        ("USA", "Institutional"): {"note": "Institutional use — no retail tax adjustments applied."},
+        ("Canada", "RESP"): {"note": "🎓 RESP use — educational investment preferences apply."},
+    }
+
+    # Store in session state
+    st.session_state["use_context"] = use_context
+    st.session_state["country"] = country
+    st.session_state["use_context_rules"] = context_rules.get((country, use_context), {})
+    st.session_state["use_context_note"] = st.session_state["use_context_rules"].get("note", "")
+
+
     st.header("Client Profile")
     goal = st.selectbox("Investment Goal", ["Retirement", "Income", "Wealth Growth"])
     risk = st.selectbox("Risk Tolerance", ["Conservative", "Balanced", "Growth"])
@@ -172,7 +281,8 @@ with tab1:
     allocation_text = {
         "Equity": "Growth-oriented exposure to drive portfolio appreciation.",
         "Bonds": "Income and capital preservation through fixed income assets.",
-        "Cash": "Liquidity buffer to reduce volatility and manage short-term needs."
+        "Cash": "Liquidity buffer to reduce volatility and manage short-term needs.",
+        "Mixed": "Balanced exposure across equity, bonds, and cash through a single diversified ETF."
     }
 
     for asset_class, pct in allocation.items():
@@ -180,59 +290,101 @@ with tab1:
         st.markdown(f"**{pct}% {asset_class}** – ${val:,.2f}")
         st.caption(allocation_text.get(asset_class, ""))
 
+if st.session_state.get("use_context_note"):
+    st.caption(st.session_state["use_context_note"])
+
     st.info("This strategy reflects a diversified blend tailored to the client’s objective and risk tolerance.")
 
-    # ✅ Include 'Other' as additional tab
-    tab_eq, tab_bd, tab_cash, tab_other = st.tabs(["Equity", "Bonds", "Cash", "Other"])
-    tab_map = {"Equity": tab_eq, "Bonds": tab_bd, "Cash": tab_cash, "Other": tab_other}
-    asset_mapping = {"Equity": "equity", "Bonds": "bond", "Cash": "cash", "Other": "other"}
 
-    for asset_class, tab in tab_map.items():
-        with tab:
-            st.markdown(f"### Top {asset_class} ETFs")
-            class_key = asset_mapping[asset_class]
+    # Add Mixed as a separate tab
+    tab_eq, tab_bd, tab_cash, tab_mixed, tab_other = st.tabs(["Equity", "Bonds", "Cash", "Mixed", "Other"])
+    tab_map = {
+        "Equity": tab_eq,
+        "Bonds": tab_bd,
+        "Cash": tab_cash,
+        "Mixed": tab_mixed,
+        "Other": tab_other
+    }
+    asset_mapping = {
+        "Equity": "equity",
+        "Bonds": "bond",
+        "Cash": "cash",
+        "Mixed": "mixed",
+        "Other": "other"
+    }
 
-            filtered = etf_df[
-                (etf_df["Simplified Asset Class"].str.lower() == class_key)
-            ].copy()
+        
+for asset_class, tab in tab_map.items():
+    with tab:
+        st.markdown(f"### Top {asset_class} ETFs")
+        class_key = asset_mapping[asset_class]
 
-            # Only apply goal/risk filters for Equity, Bonds, Cash
-            if asset_class != "Other":
-                filtered = filtered[filtered["Risk Level"].isin(risk_filters[risk])]
-                if goal in goal_preferences:
-                    try:
-                        filtered = goal_preferences[goal](filtered)
-                    except:
-                        pass
+        filtered = etf_df[
+            (etf_df["Simplified Asset Class"].str.lower() == class_key)
+        ].copy()
 
-            st.caption(f"{len(filtered)} ETFs match the filters for this asset class and goal.")
+        rules = st.session_state.get("use_context_rules", {})
 
-            filtered["1 Year"] = pd.to_numeric(filtered["1 Year"].astype(str).str.replace("%", ""), errors="coerce")
-            top_etfs = filtered.sort_values(by="1 Year", ascending=False).head(10)
+        if rules.get("avoid_us_dividends"):
+            filtered = filtered[~filtered["ETF Name"].str.contains("USD", case=False, na=False)]
 
-            for _, row in top_etfs.iterrows():
-                st.markdown(f"""
-                <div style='background:#f9f9f9; padding:15px; border-radius:10px; border:1px solid #ddd; margin-bottom:15px;'>
-                    <b><a href='https://finance.yahoo.com/quote/{row['Symbol']}' target='_blank'>{row['Symbol']}: {row['ETF Name']}</a></b><br>
-                    <b>1Y Return:</b> {row['1 Year']} &nbsp; <b>Expense Ratio:</b> {row['ER']} &nbsp; <b>Yield:</b> {row['Annual Dividend Yield %']}<br>
-                    <b>AUM:</b> {row['Total Assets']} &nbsp; <b>Risk Level:</b> {row['Risk Level']}<br>
-                </div>
-                """, unsafe_allow_html=True)
+        if rules.get("avoid_dividends"):
+            filtered = filtered[pd.to_numeric(filtered["Annual Dividend Yield %"].str.replace("%", ""), errors="coerce") < 2]
 
-            if not top_etfs.empty:
-                st.markdown("**ETF Comparison Table**")
-                st.dataframe(top_etfs[["Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", "Total Assets", "Risk Level"]]
-                             .rename(columns={
-                                 "1 Year": "1Y Return",
-                                 "ER": "Expense Ratio",
-                                 "Annual Dividend Yield %": "Yield",
-                                 "Total Assets": "AUM"
-                             }), use_container_width=True)
+        if rules.get("favor_tax_efficiency"):
+            filtered = filtered[pd.to_numeric(filtered["Annual Dividend Yield %"].str.replace("%", ""), errors="coerce") < 2.5]
+            filtered = filtered[pd.to_numeric(filtered["ER"].str.replace("%", ""), errors="coerce") < 0.3]
+
+        if rules.get("favor_growth"):
+            filtered = filtered[pd.to_numeric(filtered["1 Year"].str.replace("%", ""), errors="coerce") > 5]
+
+        if rules.get("favor_low_fee"):
+            filtered = filtered[pd.to_numeric(filtered["ER"].str.replace("%", ""), errors="coerce") < 0.25]
+
+        # Apply standard filters (goal + risk)
+        if asset_class != "Other":
+            filtered = filtered[filtered["Risk Level"].isin(risk_filters[risk])]
+            if goal in goal_preferences:
+                try:
+                    filtered = goal_preferences[goal](filtered)
+                except:
+                    pass
+
+        st.caption(f"{len(filtered)} ETFs match the filters for this asset class and goal.")
+
+        if st.session_state.get("use_context_note"):
+            st.caption(st.session_state["use_context_note"])
+
+        filtered["1 Year"] = pd.to_numeric(filtered["1 Year"].astype(str).str.replace("%", ""), errors="coerce")
+        ranked_df = rank_etfs(filtered, goal)
+        top_etfs = ranked_df.sort_values(by="Final Score", ascending=False).head(10)
+
+
+        for _, row in top_etfs.iterrows():
+            st.markdown(f"""
+            <div style='background:#f9f9f9; padding:15px; border-radius:10px; border:1px solid #ddd; margin-bottom:15px;'>
+                <b><a href='https://finance.yahoo.com/quote/{row['Symbol']}' target='_blank'>{row['Symbol']}: {row['ETF Name']}</a></b><br>
+                <b>1Y Return:</b> {row['1 Year']} &nbsp; <b>Expense Ratio:</b> {row['ER']} &nbsp; <b>Yield:</b> {row['Annual Dividend Yield %']}<br>
+                <b>AUM:</b> {row['Total Assets']} &nbsp; <b>Risk Level:</b> {row['Risk Level']}<br>
+                <b>Score:</b> {row['Final Score']:.2f}
+            </div>
+            """, unsafe_allow_html=True)
+
+
+        if not top_etfs.empty:
+            st.markdown("**ETF Comparison Table**")
+            st.dataframe(top_etfs[["Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", "Total Assets", "Risk Level"]]
+                         .rename(columns={
+                             "1 Year": "1Y Return",
+                             "ER": "Expense Ratio",
+                             "Annual Dividend Yield %": "Yield",
+                             "Total Assets": "AUM"
+                         }), use_container_width=True)
 
 # ---- ETF Screener Tab ----
 with tab2:
     st.subheader("ETF Screener")
-    asset_class_options = ["All"] + sorted(etf_df["Simplified Asset Class"].dropna().unique())
+    asset_class_options = ["All", "equity", "bond", "cash", "mixed", "other"]
     selected_asset_class = st.selectbox("Filter by Asset Class", asset_class_options)
     risk_options = ["All", "Low", "Medium", "High"]
     selected_risk = st.selectbox("Filter by Risk Level", risk_options)
@@ -295,7 +447,7 @@ with tab3:
                 col1, col2 = st.columns(2)
                 with col1:
                     st.markdown("#### Asset Class Allocation")
-                    asset_counts = merged["Simplified Asset Class"].value_counts()
+                    asset_counts = merged["Simplified Asset Class"].str.capitalize().value_counts()
                     fig1, ax1 = plt.subplots(figsize=(2.8, 2.8))
                     ax1.pie(asset_counts, labels=asset_counts.index, autopct="%1.0f%%", startangle=140, wedgeprops=dict(width=0.4))
                     st.pyplot(fig1)
@@ -363,73 +515,55 @@ with tab4:
             if not {"Symbol", "Quantity", "Price"}.issubset(uploaded_portfolio.columns):
                 st.error("Your CSV must contain 'Symbol', 'Quantity', and 'Price' columns.")
             else:
-                # Merge with ETF metadata to get asset class
+                # Merge with ETF metadata
                 merged = pd.merge(uploaded_portfolio, etf_df[["Symbol", "Simplified Asset Class"]], on="Symbol", how="left")
                 merged["Simplified Asset Class"] = merged["Simplified Asset Class"].fillna("Other")
-
                 merged["Market Value"] = merged["Quantity"] * merged["Price"]
                 merged["Weight (%)"] = (merged["Market Value"] / merged["Market Value"].sum()) * 100
-
-                # Normalize asset class to lowercase BEFORE grouping
                 merged["Simplified Asset Class"] = merged["Simplified Asset Class"].str.lower()
 
-                # Exclude 'other' before analysis
+                # ✅ Optional: Note about Mixed ETFs
+                mixed_weight = merged.loc[merged["Simplified Asset Class"] == "mixed", "Weight (%)"].sum()
+                if mixed_weight > 0:
+                    st.markdown(f"📊 **Note:** Mixed ETFs account for **{mixed_weight:.2f}%** of the portfolio. They are not included in drift calculations due to diversified composition.")
+
+                # ✅ Optional: Note about Other ETFs
+                if "other" in merged["Simplified Asset Class"].values:
+                    other_weight = merged.loc[merged["Simplified Asset Class"] == "other", "Weight (%)"].sum()
+                    st.markdown(f"📌 **Note:** 'Other' holdings account for **{other_weight:.2f}%** of the portfolio and are excluded from drift analysis.")
+
+                # ✅ Exclude non-core classes for drift analysis
                 filtered = merged[merged["Simplified Asset Class"].isin(["equity", "bond", "cash"])].copy()
 
                 actual_alloc = filtered.groupby("Simplified Asset Class")["Weight (%)"].sum().reset_index()
                 model_allocation = allocation_matrix.get((goal, risk), {})
                 normalized_model = {k.lower(): v for k, v in model_allocation.items()}
                 actual_alloc["Recommended (%)"] = actual_alloc["Simplified Asset Class"].map(normalized_model)
-
                 actual_alloc["Drift (%)"] = actual_alloc["Weight (%)"] - actual_alloc["Recommended (%)"]
 
-                display_df = actual_alloc[actual_alloc["Recommended (%)"].notna()].copy()
-
-                def highlight_drift(val):
-                    return "color: red;" if pd.notna(val) and abs(val) > 5 else ""
-
-                st.markdown("### Rebalancing Summary")
-                st.dataframe(
-                    display_df.style.applymap(highlight_drift, subset=["Drift (%)"]),
-                    use_container_width=True
-                )
-            
-                # Suggested Trade Actions
+                # Suggested actions
                 def suggest_action(row):
                     drift = row["Drift (%)"]
                     asset_class = row["Simplified Asset Class"].capitalize()
-    
                     if drift > 5:
                         return f"🔻 Reduce exposure to {asset_class} by {drift:.2f}%"
                     elif drift < -5:
                         return f"🔺 Increase exposure to {asset_class} by {abs(drift):.2f}%"
                     else:
-                        return None
+                        return "✅ On Target"
 
+                actual_alloc["Suggested Action"] = actual_alloc.apply(suggest_action, axis=1)
 
-                display_df["Suggested Action"] = display_df.apply(suggest_action, axis=1)
-                action_df = display_df.dropna(subset=["Suggested Action"])
+                # Drift highlighter
+                def highlight_drift(val):
+                    return "color: red;" if pd.notna(val) and abs(val) > 5 else ""
 
-                if not action_df.empty:
-                    st.markdown("Suggested Trade Actions")
-                    st.dataframe(
-                        action_df[["Simplified Asset Class", "Weight (%)", "Recommended (%)", "Drift (%)", "Suggested Action"]],
-                        use_container_width=True
+                st.markdown("### Rebalancing Summary with Suggested Actions")
+                st.dataframe(
+                    actual_alloc[["Simplified Asset Class", "Weight (%)", "Recommended (%)", "Drift (%)", "Suggested Action"]]
+                    .style.applymap(highlight_drift, subset=["Drift (%)"]),
+                    use_container_width=True
                 )
-
-                # Normalize asset class to lowercase
-                merged["Simplified Asset Class"] = merged["Simplified Asset Class"].str.lower()
-
-                # Note: Show 'Other' allocation note if present
-                if "other" in merged["Simplified Asset Class"].values:
-                    other_weight = merged.loc[merged["Simplified Asset Class"] == "other", "Weight (%)"].sum()
-                    st.markdown(f"📌 **Note:** 'Other' holdings account for **{other_weight:.2f}%** of the portfolio and are excluded from drift analysis.")
-
-                # Group and compare to model
-                model_allocation = allocation_matrix.get((goal, risk), {})
-                normalized_model = {k.lower(): v for k, v in model_allocation.items()}
-                actual_alloc["Recommended (%)"] = actual_alloc["Simplified Asset Class"].map(normalized_model)
-                actual_alloc["Drift (%)"] = actual_alloc["Weight (%)"] - actual_alloc["Recommended (%)"]
 
                 st.info("Red cells highlight over/underweighting greater than ±5%.")
         except Exception as e:
