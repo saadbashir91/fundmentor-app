@@ -588,7 +588,7 @@ with tab4:
                 st.markdown("### Rebalancing Summary with Suggested Actions")
                 st.dataframe(
                     actual_alloc[["Simplified Asset Class", "Weight (%)", "Recommended (%)", "Drift (%)", "Suggested Action"]]
-                    .style.applymap(highlight_drift, subset=["Drift (%)"]),
+                    .style.map(highlight_drift, subset=["Drift (%)"]),
                     use_container_width=True
                 )
 
@@ -628,8 +628,6 @@ with tab4:
 
                     # Now safely generate rebalancing actions
                     etf_rebalance_result = generate_rebalance_actions(current_df)
-                    st.dataframe(etf_rebalance_result, use_container_width=True)
-
                     st.dataframe(etf_rebalance_result, use_container_width=True)
 
         except Exception as e:
