@@ -74,6 +74,25 @@ def classify_risk(row):
     else:
         return "High"
 
+def generate_rebalance_actions(df, threshold=5):
+    if 'Weight (%)' not in df.columns or 'Target Weight (%)' not in df.columns:
+        raise ValueError("Missing 'Weight (%)' or 'Target Weight (%)' columns")
+
+    df = df.copy()
+    df['Drift (%)'] = df['Weight (%)'] - df['Target Weight (%)']
+
+    def classify_action(drift):
+        if drift > threshold:
+            return f"🔻 Reduce ({round(drift, 1)}% overweight)"
+        elif drift < -threshold:
+            return f"➕ Buy (add {abs(round(drift, 1))}%)"
+        else:
+            return f"✅ Hold ({round(drift, 1)}% in range)"
+
+    df['Action'] = df['Drift (%)'].apply(classify_action)
+
+    return df[['ETF', 'Asset Class', 'Weight (%)', 'Target Weight (%)', 'Drift (%)', 'Action']]
+
 # ---- Load ETF Data ----
 @st.cache_data
 def load_etf_data():
@@ -517,31 +536,40 @@ with tab4:
             else:
                 # Merge with ETF metadata
                 merged = pd.merge(uploaded_portfolio, etf_df[["Symbol", "Simplified Asset Class"]], on="Symbol", how="left")
+                merged["Market Value"] = merged["Quantity"] * merged["Price"]
+                merged["Weight (%)"] = (merged["Market Value"] / merged["Market Value"].sum()) * 100
                 merged["Simplified Asset Class"] = merged["Simplified Asset Class"].fillna("Other")
                 merged["Market Value"] = merged["Quantity"] * merged["Price"]
                 merged["Weight (%)"] = (merged["Market Value"] / merged["Market Value"].sum()) * 100
                 merged["Simplified Asset Class"] = merged["Simplified Asset Class"].str.lower()
 
-                # ✅ Optional: Note about Mixed ETFs
+                # Notes
                 mixed_weight = merged.loc[merged["Simplified Asset Class"] == "mixed", "Weight (%)"].sum()
                 if mixed_weight > 0:
                     st.markdown(f"📊 **Note:** Mixed ETFs account for **{mixed_weight:.2f}%** of the portfolio. They are not included in drift calculations due to diversified composition.")
 
-                # ✅ Optional: Note about Other ETFs
                 if "other" in merged["Simplified Asset Class"].values:
                     other_weight = merged.loc[merged["Simplified Asset Class"] == "other", "Weight (%)"].sum()
                     st.markdown(f"📌 **Note:** 'Other' holdings account for **{other_weight:.2f}%** of the portfolio and are excluded from drift analysis.")
 
-                # ✅ Exclude non-core classes for drift analysis
+                if "Weight (%)" not in merged.columns or merged["Weight (%)"].isnull().all():
+                    st.warning("⚠️ Cannot run rebalancing: missing or invalid weight data. Please check your file.")
+                    st.stop()
+
+                # Core asset class comparison
                 filtered = merged[merged["Simplified Asset Class"].isin(["equity", "bond", "cash"])].copy()
+                filtered["Weight (%)"] = (filtered["Market Value"] / filtered["Market Value"].sum()) * 100
+                filtered["Market Value"] = filtered["Quantity"] * filtered["Price"]
+                filtered["Weight (%)"] = (filtered["Market Value"] / filtered["Market Value"].sum()) * 100
+
 
                 actual_alloc = filtered.groupby("Simplified Asset Class")["Weight (%)"].sum().reset_index()
                 model_allocation = allocation_matrix.get((goal, risk), {})
                 normalized_model = {k.lower(): v for k, v in model_allocation.items()}
+
                 actual_alloc["Recommended (%)"] = actual_alloc["Simplified Asset Class"].map(normalized_model)
                 actual_alloc["Drift (%)"] = actual_alloc["Weight (%)"] - actual_alloc["Recommended (%)"]
 
-                # Suggested actions
                 def suggest_action(row):
                     drift = row["Drift (%)"]
                     asset_class = row["Simplified Asset Class"].capitalize()
@@ -554,7 +582,6 @@ with tab4:
 
                 actual_alloc["Suggested Action"] = actual_alloc.apply(suggest_action, axis=1)
 
-                # Drift highlighter
                 def highlight_drift(val):
                     return "color: red;" if pd.notna(val) and abs(val) > 5 else ""
 
@@ -566,7 +593,47 @@ with tab4:
                 )
 
                 st.info("Red cells highlight over/underweighting greater than ±5%.")
+
+                # ETF-Level rebalancing
+                if "Weight (%)" not in filtered.columns or filtered["Weight (%)"].isnull().all():
+                    st.warning("⚠️ Cannot run ETF-level rebalancing: weight data is missing or invalid.")
+                else:
+                    st.markdown("### ETF-Level Rebalancing Actions")
+
+                    target_df = pd.DataFrame([
+                        {"Asset Class": k.capitalize(), "Target Weight (%)": v}
+                        for k, v in normalized_model.items()
+                    ])
+
+                    # Recalculate Weight (%)
+                    filtered["Market Value"] = filtered["Quantity"] * filtered["Price"]
+                    filtered["Weight (%)"] = (filtered["Market Value"] / filtered["Market Value"].sum()) * 100
+
+                    # Prepare current portfolio
+                    current_df = filtered[["Symbol", "Simplified Asset Class", "Weight (%)"]].copy()
+                    current_df = current_df.rename(columns={
+                        "Symbol": "ETF",
+                        "Simplified Asset Class": "Asset Class"
+                    })
+                    current_df["Asset Class"] = current_df["Asset Class"].str.capitalize()
+
+                    # Prepare target portfolio by splitting total target weight across ETFs in that class
+                    target_df = pd.DataFrame([
+                        {"Asset Class": k.capitalize(), "Target Weight (%)": v}
+                        for k, v in normalized_model.items()
+                    ])
+
+                    # Merge target weights into current_df
+                    current_df = current_df.merge(target_df, on="Asset Class", how="left")
+
+                    # Now safely generate rebalancing actions
+                    etf_rebalance_result = generate_rebalance_actions(current_df)
+                    st.dataframe(etf_rebalance_result, use_container_width=True)
+
+                    st.dataframe(etf_rebalance_result, use_container_width=True)
+
         except Exception as e:
             st.error(f"Error processing file: {e}")
     else:
         st.caption("Please upload a portfolio CSV to run the Rebalancing Checker.")
+
