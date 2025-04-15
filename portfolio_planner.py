@@ -158,12 +158,69 @@ def rank_etfs(df, goal):
     return df
 
 # ---- App Tabs ----
-tab1, tab2, tab3, tab4 = st.tabs(["Portfolio Builder", "ETF Screener", "Portfolio Analyzer", "Rebalancing Checker"])
+# ---- Add Custom ETF Lists Tab ----
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Portfolio Builder", "ETF Screener", "Portfolio Analyzer", "Rebalancing Checker", "Custom ETF Lists"
+])
 
-# ---- Sidebar: Client Profile ----
+# --- Sidebar: Client Profile ---
 
 with st.sidebar:
-    # ---- Risk Questionnaire Logic ----
+    st.header("Context")
+
+    # Allow blank ("None") as default option for more flexibility
+    country = st.selectbox("Select Country", ["", "Canada", "USA"], index=0)
+
+    account_type_options = {
+        "Canada": ["", "TFSA", "RRSP", "RESP", "Non-Registered", "Institutional"],
+        "USA": ["", "Roth IRA", "401(k)", "Traditional IRA", "Taxable", "Institutional"]
+    }
+    account_type = st.selectbox("Account Type", account_type_options.get(country, [""]), index=0)
+
+    # Rules engine with fallback behavior for blanks
+    context_rules = {
+        ("Canada", "TFSA"): {
+            "avoid_us_dividends": True,
+            "favor_growth": True,
+            "note": "Recommendations adjusted for TFSA — tax-efficient growth prioritized."
+        },
+        ("Canada", "RRSP"): {
+            "avoid_us_dividends": False,
+            "favor_growth": True,
+            "note": "Optimized for RRSP — U.S. ETFs allowed without withholding tax."
+        },
+        ("Canada", "Non-Registered"): {
+            "avoid_us_dividends": True,
+            "favor_tax_efficiency": True,
+            "note": "Tax-efficient ETFs prioritized for non-registered account."
+        },
+        ("USA", "Roth IRA"): {
+            "avoid_dividends": True,
+            "favor_growth": True,
+            "note": "Roth IRA: growth-focused with tax-free appreciation."
+        },
+        ("USA", "401(k)"): {
+            "favor_low_fee": True,
+            "note": "401(k): cost efficiency and retirement growth prioritized."
+        },
+        ("USA", "Taxable"): {
+            "favor_tax_efficiency": True,
+            "note": "Taxable account: ETFs ranked for tax-efficient income."
+        },
+        ("Canada", "Institutional"): {"note": "Institutional use — no retail tax adjustments applied."},
+        ("USA", "Institutional"): {"note": "Institutional use — no retail tax adjustments applied."},
+        ("Canada", "RESP"): {"note": "🎓 RESP use — educational investment preferences apply."},
+    }
+
+    rules_key = (country, account_type)
+    rules_applied = context_rules.get(rules_key, {})
+
+    st.session_state["use_context"] = account_type
+    st.session_state["country"] = country
+    st.session_state["use_context_rules"] = rules_applied
+    st.session_state["use_context_note"] = rules_applied.get("note", "")
+
+    # Risk questionnaire logic (unchanged)
     if "show_risk_quiz" not in st.session_state:
         st.session_state["show_risk_quiz"] = False
     if "quiz_step" not in st.session_state:
@@ -226,61 +283,6 @@ with st.sidebar:
 
             st.markdown("This result is a guide and should be discussed further with an advisor if unsure.")
 
-    # ---- Country & Use Context ----
-    st.header("Context")
-
-    country = st.selectbox("Select Country", ["Canada", "USA"])
-
-    # Dynamic options based on country
-    use_context_options = {
-        "Canada": ["TFSA", "RRSP", "RESP", "Non-Registered", "Institutional"],
-        "USA": ["Roth IRA", "401(k)", "Traditional IRA", "Taxable", "Institutional"]
-    }
-    use_context = st.selectbox("Use Context", use_context_options[country])
-
-    # Rules engine
-    context_rules = {
-        ("Canada", "TFSA"): {
-            "avoid_us_dividends": True,
-            "favor_growth": True,
-            "note": "Recommendations adjusted for TFSA — tax-efficient growth prioritized."
-        },
-        ("Canada", "RRSP"): {
-            "avoid_us_dividends": False,
-            "favor_growth": True,
-            "note": "Optimized for RRSP — U.S. ETFs allowed without withholding tax."
-        },
-        ("Canada", "Non-Registered"): {
-            "avoid_us_dividends": True,
-            "favor_tax_efficiency": True,
-            "note": "Tax-efficient ETFs prioritized for non-registered account."
-        },
-        ("USA", "Roth IRA"): {
-            "avoid_dividends": True,
-            "favor_growth": True,
-            "note": "Roth IRA: growth-focused with tax-free appreciation."
-        },
-        ("USA", "401(k)"): {
-            "favor_low_fee": True,
-            "note": "401(k): cost efficiency and retirement growth prioritized."
-        },
-        ("USA", "Taxable"): {
-            "favor_tax_efficiency": True,
-            "note": "Taxable account: ETFs ranked for tax-efficient income."
-        },
-        # Fallback
-        ("Canada", "Institutional"): {"note": "Institutional use — no retail tax adjustments applied."},
-        ("USA", "Institutional"): {"note": "Institutional use — no retail tax adjustments applied."},
-        ("Canada", "RESP"): {"note": "🎓 RESP use — educational investment preferences apply."},
-    }
-
-    # Store in session state
-    st.session_state["use_context"] = use_context
-    st.session_state["country"] = country
-    st.session_state["use_context_rules"] = context_rules.get((country, use_context), {})
-    st.session_state["use_context_note"] = st.session_state["use_context_rules"].get("note", "")
-
-
     st.header("Client Profile")
     goal = st.selectbox("Investment Goal", ["Retirement", "Income", "Wealth Growth"])
     risk = st.selectbox("Risk Tolerance", ["Conservative", "Balanced", "Growth"])
@@ -309,13 +311,16 @@ with tab1:
         st.markdown(f"**{pct}% {asset_class}** – ${val:,.2f}")
         st.caption(allocation_text.get(asset_class, ""))
 
-if st.session_state.get("use_context_note"):
-    st.caption(st.session_state["use_context_note"])
+        # Show the note if available
+    if st.session_state.get("use_context_note"):
+        st.caption(st.session_state["use_context_note"])
+    else:
+        st.caption("📌 No account-specific filtering applied. Showing standard recommendations.")
 
-    st.info("This strategy reflects a diversified blend tailored to the client’s objective and risk tolerance.")
+    # Strategy context note
+        st.info("This strategy reflects a diversified blend tailored to the client’s objective and risk tolerance.")
 
-
-    # Add Mixed as a separate tab
+    # Proceed to show ETF tabs regardless of context filters
     tab_eq, tab_bd, tab_cash, tab_mixed, tab_other = st.tabs(["Equity", "Bonds", "Cash", "Mixed", "Other"])
     tab_map = {
         "Equity": tab_eq,
@@ -332,73 +337,73 @@ if st.session_state.get("use_context_note"):
         "Other": "other"
     }
 
-        
-for asset_class, tab in tab_map.items():
-    with tab:
-        st.markdown(f"### Top {asset_class} ETFs")
-        class_key = asset_mapping[asset_class]
+    for asset_class, tab in tab_map.items():
+        with tab:
+            st.markdown(f"### Top {asset_class} ETFs")
+            class_key = asset_mapping[asset_class]
 
-        filtered = etf_df[
-            (etf_df["Simplified Asset Class"].str.lower() == class_key)
-        ].copy()
+            filtered = etf_df[
+                (etf_df["Simplified Asset Class"].str.lower() == class_key)
+            ].copy()
 
-        rules = st.session_state.get("use_context_rules", {})
+            rules = st.session_state.get("use_context_rules") or {}
 
-        if rules.get("avoid_us_dividends"):
-            filtered = filtered[~filtered["ETF Name"].str.contains("USD", case=False, na=False)]
+            if rules.get("avoid_us_dividends"):
+                filtered = filtered[~filtered["ETF Name"].str.contains("USD", case=False, na=False)]
 
-        if rules.get("avoid_dividends"):
-            filtered = filtered[pd.to_numeric(filtered["Annual Dividend Yield %"].str.replace("%", ""), errors="coerce") < 2]
+            if rules.get("avoid_dividends"):
+                filtered = filtered[pd.to_numeric(filtered["Annual Dividend Yield %"].str.replace("%", ""), errors="coerce") < 2]
 
-        if rules.get("favor_tax_efficiency"):
-            filtered = filtered[pd.to_numeric(filtered["Annual Dividend Yield %"].str.replace("%", ""), errors="coerce") < 2.5]
-            filtered = filtered[pd.to_numeric(filtered["ER"].str.replace("%", ""), errors="coerce") < 0.3]
+            if rules.get("favor_tax_efficiency"):
+                filtered = filtered[pd.to_numeric(filtered["Annual Dividend Yield %"].str.replace("%", ""), errors="coerce") < 2.5]
+                filtered = filtered[pd.to_numeric(filtered["ER"].str.replace("%", ""), errors="coerce") < 0.3]
 
-        if rules.get("favor_growth"):
-            filtered = filtered[pd.to_numeric(filtered["1 Year"].str.replace("%", ""), errors="coerce") > 5]
+            if rules.get("favor_growth"):
+                filtered = filtered[pd.to_numeric(filtered["1 Year"].str.replace("%", ""), errors="coerce") > 5]
 
-        if rules.get("favor_low_fee"):
-            filtered = filtered[pd.to_numeric(filtered["ER"].str.replace("%", ""), errors="coerce") < 0.25]
+            if rules.get("favor_low_fee"):
+                filtered = filtered[pd.to_numeric(filtered["ER"].str.replace("%", ""), errors="coerce") < 0.25]
 
-        # Apply standard filters (goal + risk)
-        if asset_class != "Other":
-            filtered = filtered[filtered["Risk Level"].isin(risk_filters[risk])]
-            if goal in goal_preferences:
-                try:
-                    filtered = goal_preferences[goal](filtered)
-                except:
-                    pass
+            # Apply standard filters (goal + risk)
+            if asset_class != "Other":
+                filtered = filtered[filtered["Risk Level"].isin(risk_filters[risk])]
+                if goal in goal_preferences:
+                    try:
+                        filtered = goal_preferences[goal](filtered)
+                    except:
+                        pass
 
-        st.caption(f"{len(filtered)} ETFs match the filters for this asset class and goal.")
+            st.caption(f"{len(filtered)} ETFs match the filters for this asset class and goal.")
 
-        if st.session_state.get("use_context_note"):
-            st.caption(st.session_state["use_context_note"])
-
-        filtered["1 Year"] = pd.to_numeric(filtered["1 Year"].astype(str).str.replace("%", ""), errors="coerce")
-        ranked_df = rank_etfs(filtered, goal)
-        top_etfs = ranked_df.sort_values(by="Final Score", ascending=False).head(10)
+            if st.session_state.get("use_context_note"):
+                st.caption(st.session_state["use_context_note"])
+            elif not st.session_state.get("country") or not st.session_state.get("use_context"):
+                st.caption("📌 No account-specific filtering applied. Showing standard recommendations.")
 
 
-        for _, row in top_etfs.iterrows():
-            st.markdown(f"""
-            <div style='background:#f9f9f9; padding:15px; border-radius:10px; border:1px solid #ddd; margin-bottom:15px;'>
-                <b><a href='https://finance.yahoo.com/quote/{row['Symbol']}' target='_blank'>{row['Symbol']}: {row['ETF Name']}</a></b><br>
-                <b>1Y Return:</b> {row['1 Year']} &nbsp; <b>Expense Ratio:</b> {row['ER']} &nbsp; <b>Yield:</b> {row['Annual Dividend Yield %']}<br>
-                <b>AUM:</b> {row['Total Assets']} &nbsp; <b>Risk Level:</b> {row['Risk Level']}<br>
-                <b>Score:</b> {row['Final Score']:.2f}
-            </div>
-            """, unsafe_allow_html=True)
+            filtered["1 Year"] = pd.to_numeric(filtered["1 Year"].astype(str).str.replace("%", ""), errors="coerce")
+            ranked_df = rank_etfs(filtered, goal)
+            top_etfs = ranked_df.sort_values(by="Final Score", ascending=False).head(10)
 
+            for _, row in top_etfs.iterrows():
+                st.markdown(f"""
+                <div style='background:#f9f9f9; padding:15px; border-radius:10px; border:1px solid #ddd; margin-bottom:15px;'>
+                    <b><a href='https://finance.yahoo.com/quote/{row['Symbol']}' target='_blank'>{row['Symbol']}: {row['ETF Name']}</a></b><br>
+                    <b>1Y Return:</b> {row['1 Year']} &nbsp; <b>Expense Ratio:</b> {row['ER']} &nbsp; <b>Yield:</b> {row['Annual Dividend Yield %']}<br>
+                    <b>AUM:</b> {row['Total Assets']} &nbsp; <b>Risk Level:</b> {row['Risk Level']}<br>
+                    <b>Score:</b> {row['Final Score']:.2f}
+                </div>
+                """, unsafe_allow_html=True)
 
-        if not top_etfs.empty:
-            st.markdown("**ETF Comparison Table**")
-            st.dataframe(top_etfs[["Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", "Total Assets", "Risk Level"]]
-                         .rename(columns={
-                             "1 Year": "1Y Return",
-                             "ER": "Expense Ratio",
-                             "Annual Dividend Yield %": "Yield",
-                             "Total Assets": "AUM"
-                         }), use_container_width=True)
+            if not top_etfs.empty:
+                st.markdown("**ETF Comparison Table**")
+                st.dataframe(top_etfs[["Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", "Total Assets", "Risk Level"]]
+                                 .rename(columns={
+                                     "1 Year": "1Y Return",
+                                     "ER": "Expense Ratio",
+                                     "Annual Dividend Yield %": "Yield",
+                                     "Total Assets": "AUM"
+                                 }), use_container_width=True)
 
 # ---- ETF Screener Tab ----
 with tab2:
@@ -635,3 +640,168 @@ with tab4:
     else:
         st.caption("Please upload a portfolio CSV to run the Rebalancing Checker.")
 
+with tab5:
+    st.subheader("Custom ETF Lists (Session-Only)")
+    st.caption("Upload one or more of your own ETF lists to filter, rank, and manage portfolios. No data is stored after the session ends.")
+
+    if "custom_etf_lists" not in st.session_state:
+        st.session_state["custom_etf_lists"] = {}
+
+    uploaded_file = st.file_uploader("Upload CSV File", type=["csv"], key="custom_etf_upload")
+    list_name = st.text_input("Name this list", key="custom_etf_name")
+
+    if uploaded_file and list_name:
+        try:
+            df = pd.read_csv(uploaded_file)
+            df.columns = [col.strip() for col in df.columns]  # clean column names
+            st.session_state["custom_etf_lists"][list_name] = df
+            st.success(f"✅ List '{list_name}' uploaded successfully.")
+        except Exception as e:
+            st.error(f"❌ Upload failed: {e}")
+
+    if st.session_state["custom_etf_lists"]:
+        st.subheader("Your Uploaded Lists")
+        selected_list = st.selectbox("Choose a list to view", list(st.session_state["custom_etf_lists"].keys()), key="custom_list_selector")
+
+        if selected_list:
+            df_view = st.session_state["custom_etf_lists"][selected_list]
+            st.write(f"### {selected_list} — {len(df_view)} ETFs")
+
+            if "Symbol" not in df_view.columns:
+                st.warning("⚠️ Your file must include a 'Symbol' column to identify ETFs.")
+            else:
+                goal_input = goal
+                risk_input = risk
+
+                def get_weights(goal, available):
+                    base = {
+                        "1 Year": 0.3, "ER": 0.2, "Total Assets": 0.1,
+                        "Annual Dividend Yield %": 0.2, "TaxEff": 0.2
+                    }
+                    if goal == "Income":
+                        base["Annual Dividend Yield %"] = 0.3
+                        base["1 Year"] = 0.1
+                    elif goal == "Wealth Growth":
+                        base["1 Year"] = 0.4
+                        base["Annual Dividend Yield %"] = 0.1
+                    return {k: v for k, v in base.items() if k in available}
+
+                df_clean = df_view.copy()
+                df_clean.columns = [col.strip() for col in df_clean.columns]
+
+                numeric_cols = {
+                    "1 Year": "%", "ER": "%", "Annual Dividend Yield %": "%", "Total Assets": "$"
+                }
+
+                for col, symbol in numeric_cols.items():
+                    if col in df_clean.columns:
+                        df_clean[col] = pd.to_numeric(
+                            df_clean[col].astype(str).str.replace(symbol, "", regex=False).str.replace(",", ""),
+                            errors="coerce"
+                        )
+
+                if "Annual Dividend Yield %" in df_clean.columns and "ER" in df_clean.columns:
+                    df_clean["TaxEff"] = 1 / (df_clean["Annual Dividend Yield %"] + df_clean["ER"])
+
+                # Ensure Risk Level is computed before filtering
+                if "Risk Level" not in df_clean.columns:
+                    df_clean["Risk Level"] = df_clean.apply(classify_risk, axis=1)
+
+                available_cols = df_clean.columns.tolist()
+                weights = get_weights(goal_input, available_cols)
+
+                if not weights:
+                    st.warning("⚠️ No usable columns found to apply scoring.")
+                else:
+                    def normalize(series):
+                        return (series - series.min()) / (series.max() - series.min())
+
+                    score = pd.Series(0, index=df_clean.index)
+                    for col, weight in weights.items():
+                        try:
+                            score += normalize(df_clean[col]) * weight
+                        except:
+                            continue
+                    df_clean["Final Score"] = score
+
+                    # Auto-classify into simplified asset classes
+                    if "ETF Name" in df_clean.columns:
+                        keywords = {
+                            "Bond": ["bond", "fixed income", "rate", "yield"],
+                            "Equity": ["equity", "stock", "dividend", "shares", "growth", "capital"],
+                            "Cash": ["money market", "cash", "ultra short", "treasury"],
+                            "Mixed": ["balanced", "allocation", "portfolio", "vgro", "vbal", "xbal", "xgro", "zbal", "zbla"],
+                        }
+
+                        def classify_name(name):
+                            name = str(name).lower()
+                            for category, words in keywords.items():
+                                if any(w in name for w in words):
+                                    return category
+                            return "Other"
+
+                        df_clean["Simplified Asset Class"] = df_clean["ETF Name"].apply(classify_name)
+                    else:
+                        df_clean["Simplified Asset Class"] = "Other"
+
+                    # Apply Goal Preferences (clean version)
+                    goal_preferences_clean = {
+                        "Retirement": lambda df: df[df["Annual Dividend Yield %"] > 1.8],
+                        "Income": lambda df: df[df["Annual Dividend Yield %"] > 2.2],
+                        "Wealth Growth": lambda df: df[df["1 Year"] > 6]
+                    }
+
+                    if goal_input in goal_preferences_clean:
+                        try:
+                            df_clean = goal_preferences_clean[goal_input](df_clean)
+                        except Exception as e:
+                            st.warning(f"⚠️ Could not apply goal filter: {e}")
+
+                    # Apply Risk Filter
+                    if risk_input in risk_filters:
+                        df_clean = df_clean[df_clean["Risk Level"].isin(risk_filters[risk_input])]
+
+                    # Apply Account Type Filters
+                    rules = st.session_state.get("use_context_rules") or {}
+
+                    if rules.get("avoid_us_dividends") and "ETF Name" in df_clean.columns:
+                        df_clean = df_clean[~df_clean["ETF Name"].str.contains("USD", case=False, na=False)]
+
+                    if rules.get("avoid_dividends") and "Annual Dividend Yield %" in df_clean.columns:
+                        df_clean = df_clean[pd.to_numeric(df_clean["Annual Dividend Yield %"], errors="coerce") < 2]
+
+                    if rules.get("favor_tax_efficiency") and "Annual Dividend Yield %" in df_clean.columns and "ER" in df_clean.columns:
+                        df_clean = df_clean[
+                            (pd.to_numeric(df_clean["Annual Dividend Yield %"], errors="coerce") < 2.5) &
+                            (pd.to_numeric(df_clean["ER"], errors="coerce") < 0.3)
+                        ]
+
+                    if rules.get("favor_growth") and "1 Year" in df_clean.columns:
+                        df_clean = df_clean[pd.to_numeric(df_clean["1 Year"], errors="coerce") > 5]
+
+                    if rules.get("favor_low_fee") and "ER" in df_clean.columns:
+                        df_clean = df_clean[pd.to_numeric(df_clean["ER"], errors="coerce") < 0.25]
+
+                    if st.session_state.get("use_context_note"):
+                        st.caption(f"Account-specific filtering applied: {st.session_state['use_context_note']}")
+                    else:
+                        st.caption("📌 No account-specific filtering applied.")
+
+                    # Main Table
+                    display_cols = ["Symbol", "ETF Name"] if "ETF Name" in df_clean.columns else ["Symbol"]
+                    display_cols += list(weights.keys()) + ["Final Score", "Simplified Asset Class"]
+
+                    st.dataframe(df_clean[display_cols].sort_values(by="Final Score", ascending=False), use_container_width=True)
+
+                    # Tabs by Asset Class
+                    tab_eq, tab_bd, tab_cash, tab_mixed, tab_other = st.tabs(["Equity", "Bonds", "Cash", "Mixed", "Other"])
+                    tab_map = {
+                        "Equity": tab_eq, "Bond": tab_bd, "Cash": tab_cash, "Mixed": tab_mixed, "Other": tab_other
+                    }
+
+                    for class_name, tab in tab_map.items():
+                        with tab:
+                            class_df = df_clean[df_clean["Simplified Asset Class"] == class_name]
+                            st.markdown(f"### {class_name} ETFs — {len(class_df)}")
+                            if not class_df.empty:
+                                st.dataframe(class_df[display_cols].sort_values(by="Final Score", ascending=False), use_container_width=True)
