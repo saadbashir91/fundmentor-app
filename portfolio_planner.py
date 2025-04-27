@@ -311,16 +311,14 @@ with tab1:
         st.markdown(f"**{pct}% {asset_class}** – ${val:,.2f}")
         st.caption(allocation_text.get(asset_class, ""))
 
-        # Show the note if available
     if st.session_state.get("use_context_note"):
         st.caption(st.session_state["use_context_note"])
     else:
         st.caption("📌 No account-specific filtering applied. Showing standard recommendations.")
 
-    # Strategy context note
-        st.info("This strategy reflects a diversified blend tailored to the client’s objective and risk tolerance.")
+    st.info("This strategy reflects a diversified blend tailored to the client’s objective and risk tolerance.")
 
-    # Proceed to show ETF tabs regardless of context filters
+    # Tabs by asset class
     tab_eq, tab_bd, tab_cash, tab_mixed, tab_other = st.tabs(["Equity", "Bonds", "Cash", "Mixed", "Other"])
     tab_map = {
         "Equity": tab_eq,
@@ -339,7 +337,7 @@ with tab1:
 
     for asset_class, tab in tab_map.items():
         with tab:
-            st.markdown(f"### Top {asset_class} ETFs")
+            st.markdown(f"### {asset_class} ETF Recommendations")
             class_key = asset_mapping[asset_class]
 
             filtered = etf_df[
@@ -355,8 +353,10 @@ with tab1:
                 filtered = filtered[pd.to_numeric(filtered["Annual Dividend Yield %"].str.replace("%", ""), errors="coerce") < 2]
 
             if rules.get("favor_tax_efficiency"):
-                filtered = filtered[pd.to_numeric(filtered["Annual Dividend Yield %"].str.replace("%", ""), errors="coerce") < 2.5]
-                filtered = filtered[pd.to_numeric(filtered["ER"].str.replace("%", ""), errors="coerce") < 0.3]
+                filtered = filtered[
+                    (pd.to_numeric(filtered["Annual Dividend Yield %"].str.replace("%", ""), errors="coerce") < 2.5) &
+                    (pd.to_numeric(filtered["ER"].str.replace("%", ""), errors="coerce") < 0.3)
+                ]
 
             if rules.get("favor_growth"):
                 filtered = filtered[pd.to_numeric(filtered["1 Year"].str.replace("%", ""), errors="coerce") > 5]
@@ -364,7 +364,6 @@ with tab1:
             if rules.get("favor_low_fee"):
                 filtered = filtered[pd.to_numeric(filtered["ER"].str.replace("%", ""), errors="coerce") < 0.25]
 
-            # Apply standard filters (goal + risk)
             if asset_class != "Other":
                 filtered = filtered[filtered["Risk Level"].isin(risk_filters[risk])]
                 if goal in goal_preferences:
@@ -378,32 +377,70 @@ with tab1:
             if st.session_state.get("use_context_note"):
                 st.caption(st.session_state["use_context_note"])
             elif not st.session_state.get("country") or not st.session_state.get("use_context"):
-                st.caption("📌 No account-specific filtering applied. Showing standard recommendations.")
-
+                st.caption("📌 No account-specific filtering applied.")
 
             filtered["1 Year"] = pd.to_numeric(filtered["1 Year"].astype(str).str.replace("%", ""), errors="coerce")
             ranked_df = rank_etfs(filtered, goal)
-            top_etfs = ranked_df.sort_values(by="Final Score", ascending=False).head(10)
+            ranked_df = ranked_df.sort_values(by="Final Score", ascending=False)
 
-            for _, row in top_etfs.iterrows():
-                st.markdown(f"""
-                <div style='background:#f9f9f9; padding:15px; border-radius:10px; border:1px solid #ddd; margin-bottom:15px;'>
-                    <b><a href='https://finance.yahoo.com/quote/{row['Symbol']}' target='_blank'>{row['Symbol']}: {row['ETF Name']}</a></b><br>
-                    <b>1Y Return:</b> {row['1 Year']} &nbsp; <b>Expense Ratio:</b> {row['ER']} &nbsp; <b>Yield:</b> {row['Annual Dividend Yield %']}<br>
-                    <b>AUM:</b> {row['Total Assets']} &nbsp; <b>Risk Level:</b> {row['Risk Level']}<br>
-                    <b>Score:</b> {row['Final Score']:.2f}
-                </div>
-                """, unsafe_allow_html=True)
+            if ranked_df.empty:
+                st.info("No ETFs available after filtering.")
+            else:
+                # --- Tier Logic Corrected ---
+                tier_1 = ranked_df[ranked_df["Final Score"] >= 0.65]
+                tier_2 = ranked_df[(ranked_df["Final Score"] >= 0.55) & (ranked_df["Final Score"] < 0.65)]
+                tier_3 = ranked_df[(ranked_df["Final Score"] >= 0.40) & (ranked_df["Final Score"] < 0.55)]
 
-            if not top_etfs.empty:
-                st.markdown("**ETF Comparison Table**")
-                st.dataframe(top_etfs[["Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", "Total Assets", "Risk Level"]]
-                                 .rename(columns={
-                                     "1 Year": "1Y Return",
-                                     "ER": "Expense Ratio",
-                                     "Annual Dividend Yield %": "Yield",
-                                     "Total Assets": "AUM"
-                                 }), use_container_width=True)
+                if not tier_1.empty:
+                    st.markdown("### Tier 1 ETFs")
+                    top_3 = tier_1.head(3)
+                    for _, row in top_3.iterrows():
+                        st.markdown(f"""
+                        <div style='background:#eef9f2; padding:15px; border-radius:10px; border:1px solid #b6e5c5; margin-bottom:15px;'>
+                            <b><a href='https://finance.yahoo.com/quote/{row['Symbol']}' target='_blank'>{row['Symbol']}: {row['ETF Name']}</a></b><br>
+                            <b>1Y Return:</b> {row['1 Year']} &nbsp; <b>Expense Ratio:</b> {row['ER']} &nbsp; <b>Yield:</b> {row['Annual Dividend Yield %']}<br>
+                            <b>AUM:</b> {row['Total Assets']} &nbsp; <b>Risk Level:</b> {row['Risk Level']}<br>
+                            <b>Score:</b> {row['Final Score']:.2f}
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    st.markdown("**Full Tier 1 Comparison Table**")
+                    st.dataframe(
+                        tier_1[["Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", "Total Assets", "Risk Level"]]
+                        .rename(columns={
+                            "1 Year": "1Y Return",
+                            "ER": "Expense Ratio",
+                            "Annual Dividend Yield %": "Yield",
+                            "Total Assets": "AUM"
+                        }),
+                        use_container_width=True
+                    )
+
+                if not tier_2.empty:
+                    st.markdown("### Tier 2 ETFs (Strong Alternatives)")
+                    st.dataframe(
+                        tier_2[["Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", "Total Assets", "Risk Level"]]
+                        .rename(columns={
+                            "1 Year": "1Y Return",
+                            "ER": "Expense Ratio",
+                            "Annual Dividend Yield %": "Yield",
+                            "Total Assets": "AUM"
+                        }),
+                        use_container_width=True
+                    )
+
+                if not tier_3.empty:
+                    st.markdown("### Tier 3 ETFs (Broader Exploration)")
+                    st.dataframe(
+                        tier_3[["Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", "Total Assets", "Risk Level"]]
+                        .rename(columns={
+                            "1 Year": "1Y Return",
+                            "ER": "Expense Ratio",
+                            "Annual Dividend Yield %": "Yield",
+                            "Total Assets": "AUM"
+                        }),
+                        use_container_width=True
+                    )
 
 # ---- ETF Screener Tab ----
 with tab2:
