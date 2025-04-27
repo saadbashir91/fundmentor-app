@@ -392,7 +392,7 @@ with tab1:
                 tier_3 = ranked_df[(ranked_df["Final Score"] >= 0.40) & (ranked_df["Final Score"] < 0.55)]
 
                 if not tier_1.empty:
-                    st.markdown("### Tier 1 ETFs - (highest rated)")
+                    st.markdown("### Tier 1 ETFs (highest rated)")
                     top_3 = tier_1.head(3)
                     for _, row in top_3.iterrows():
                         st.markdown(f"""
