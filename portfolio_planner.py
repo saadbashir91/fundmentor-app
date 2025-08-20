@@ -839,9 +839,13 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 ])
 
 # --- Sidebar: Client Profile ---
-
 with st.sidebar:
+    st.markdown("### FundMentor")
+    st.caption("Smarter Portfolios, Built for Advisors & Investors")
+    st.write("---")  # divider
+
     st.header("Context")
+
 
     # Choose which Excel to use
     dataset_choice = st.radio(
