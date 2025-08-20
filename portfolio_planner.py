@@ -5,16 +5,28 @@ import os
 import datetime as dt, pathlib  # A1 banner
 import re                       # A4 screener toggle
 
-# ==== DATA SOURCE SETTINGS ====
+global etf_df, NEW_DATA_PATH, NEW_DATA_SHEET
+
+# ——— SAFETY: make sure the name exists even before loading ———
+etf_df = pd.DataFrame()
+
+def _has_etf_data():
+    return 'etf_df' in globals() and isinstance(etf_df, pd.DataFrame) and not etf_df.empty
+
 # ==== DATA SOURCE SETTINGS ====
 USE_NEW_DATA = True  # keep using Excel files
 
-# --- Point these to your actual files (keep the .xlsx extension) ---
-US_DATA_PATH = "US ETFs.xlsx"   # e.g., /mnt/data/screener-etf-2025-08-15.xlsx if you don't rename
-US_DATA_SHEET = "Export"        # change if your US file uses a different sheet name
+from pathlib import Path  # add this import if not already present
 
-CA_DATA_PATH = "CA ETFs.xlsx"   # e.g., /mnt/data/screener-etf-2025-08-15 (1).xlsx if you don't rename
-CA_DATA_SHEET = "Export"        # change if your CA file uses a different sheet name
+# Resolve the Excel files based on where THIS .py file lives
+BASE = Path(__file__).parent
+
+US_DATA_PATH = str((BASE / "US ETFs.xlsx").resolve())
+US_DATA_SHEET = "Export"
+
+CA_DATA_PATH = str((BASE / "CA ETFs.xlsx").resolve())
+CA_DATA_SHEET = "Export"
+
 
 # Fallback defaults (used when no region picked)
 DEFAULT_DATA_PATH = US_DATA_PATH
@@ -23,8 +35,6 @@ DEFAULT_DATA_SHEET = US_DATA_SHEET
 # These two get set dynamically later based on your choice/country
 NEW_DATA_PATH = DEFAULT_DATA_PATH
 NEW_DATA_SHEET = DEFAULT_DATA_SHEET
-
-OLD_DATA_PATH = "etf_asset_class_tagged.csv"  # keep legacy CSV fallback if needed
 
 st.set_page_config(page_title="FundMentor", layout="wide")
 
@@ -142,17 +152,30 @@ def generate_rebalance_actions(df, threshold=5):
 
     return df[['ETF', 'Asset Class', 'Weight (%)', 'Target Weight (%)', 'Drift (%)', 'Action']]
 
+
 def infer_listing_country(symbol, name="", tags=""):
-    s = str(symbol or "").upper()
-    # Obvious TSX/NEO/Canadian suffixes
-    if any(s.endswith(suf) for suf in ["TO", "TSX", "TSXV", "NE", "NEO", "CN"]):
+    """
+    BEST-EFFORT fallback only.
+    Detect common Canadian and US exchange *prefixes* (e.g., "TSX:"),
+    then fall back to *strict* suffix checks like ".TO" or "-NE".
+    Default = USA.
+    """
+    s_raw = str(symbol or "").upper().strip()
+
+    # --- Prefix patterns (strongest signal) ---
+    if s_raw.startswith(("TSX:", "TSXV:", "NEO:", "CSE:", "CBOE CANADA:", "TSE:")):
         return "Canada"
-    # Heuristics from the text too
-    txt = f"{name} {tags}".lower()
-    if any(w in txt for w in ["tsx", "toronto", "canada"]):
+    if s_raw.startswith(("NYSE:", "NASDAQ:", "NYSEARCA:", "AMEX:", "CBOE:", "BATS:", "ARCA:")):
+        return "USA"
+
+    # --- Strict suffix patterns (require dot or hyphen before the code) ---
+    # Examples: "VFV.TO", "SHOP.TSX", "ABC-NE", "XYZ-CN"
+    import re
+    if re.search(r'(\.(TO|TSX|TSXV|NE|NEO|CN)|-(NE|CN))$', s_raw):
         return "Canada"
-    # Default fallback
+
     return "USA"
+
 
 def get_country_policy(country: str, account_type: str, asset_class: str):
     """
@@ -186,26 +209,167 @@ def get_country_policy(country: str, account_type: str, asset_class: str):
 
     return policy
 
+# --- Account-aware tax scoring (simple rules) ---
+def _tax_flag_and_score(row, country: str, account_type: str):
+    """
+    Returns (flag_text, score_float in [0,1]) based on simple, explainable rules.
+    Higher score = more tax efficient for the chosen account.
+    """
+    ac = str(row.get("Simplified Asset Class", "")).lower()   # equity/bond/cash/mixed/other
+    lst = str(row.get("Listing Country", "")).strip() or "Unknown"
+    yld = pd.to_numeric(str(row.get("Annual Dividend Yield %", "")).replace("%",""), errors="coerce")
+    er  = pd.to_numeric(str(row.get("ER","")).replace("%",""), errors="coerce")
+
+    # normalize edge cases: if values look like 0.05 => 5%
+    if pd.notna(yld) and yld <= 1.5: yld *= 100
+    if pd.notna(er)  and er  <= 1.5: er  *= 100
+
+    yld = 0.0 if pd.isna(yld) else float(yld)
+    er  = 0.0 if pd.isna(er)  else float(er)
+
+    # start from a neutral baseline that slightly rewards lower yield+fee drag
+    # (keeps continuity with your previous proxy, but bounded to [0,1])
+    base = 1.0 - min((yld*0.003 + er*0.0025), 0.6)   # gentle penalty, cap at 0.6
+    score = max(0.0, min(1.0, base))
+    flag  = []  # accumulate short notes
+
+    # ---------- CANADA ----------
+    if country == "Canada":
+        if account_type in {"TFSA", "RESP"}:
+            # US-listed distributions face unrecoverable withholding; avoid for income ETFs
+            if lst == "USA" and yld >= 1.0:
+                score *= 0.75
+                flag.append("US withholding in TFSA/RESP")
+            if ac == "bond" and yld >= 1.5:
+                score *= 0.85
+                flag.append("Interest fully taxed (shelter vs tfsa cap)")
+
+        elif account_type == "RRSP":
+            # US-listed equity dividends generally avoid 15% withholding when held in RRSP
+            if ac == "equity" and lst == "USA":
+                score *= 1.05
+                flag.append("No US WHT in RRSP")
+            # High-yield covered-call style still creates ordinary income; light nudge down
+            if yld >= 4.0:
+                score *= 0.95
+                flag.append("High income drag in RRSP")
+
+        elif account_type == "Non-Registered":
+            # Interest is fully taxable; nudge bonds down
+            if ac == "bond":
+                score *= 0.85
+                flag.append("Interest fully taxable")
+            # High dividend yield increases annual tax drag
+            if yld >= 3.0:
+                score *= 0.90
+                flag.append("High dividend tax drag")
+            # Canadian-listed equity gets a small nod (eligible dividend mechanics)
+            if ac == "equity" and lst == "Canada":
+                score *= 1.03
+                flag.append("Eligible dividends (CAD)")
+
+    # ---------- USA ----------
+    elif country == "USA":
+        if account_type in {"Roth IRA", "Traditional IRA", "401(k)"}:
+            # Prefer growth/low yield inside tax-advantaged; dividends are less valuable
+            if yld >= 2.0:
+                score *= 0.92
+                flag.append("Less benefit to dividends inside IRA/401(k)")
+            # Bonds are fine inside tax-advantaged, so remove most penalty
+            if ac == "bond":
+                score *= 1.05
+                flag.append("Bond income sheltered")
+
+        elif account_type in {"Taxable"}:
+            # Prefer lower ongoing distributions in taxable
+            if yld >= 3.0:
+                score *= 0.88
+                flag.append("High dividend tax drag (taxable)")
+            if ac == "bond":
+                score *= 0.85
+                flag.append("Bond interest taxed at ordinary rate")
+
+    # Mixed/cash: keep near neutral, slight nudge for cash-like in taxable (interest)
+    if ac == "cash" and account_type in {"Taxable","Non-Registered"}:
+        score *= 0.95
+        flag.append("Interest taxed annually")
+
+    # Bound result
+    score = max(0.05, min(1.0, score))  # never zero, to avoid killing candidates entirely
+    note  = " • ".join(flag) if flag else ""
+    return note, score
+
+def add_account_tax_scores(df: pd.DataFrame, country: str, account_type: str) -> pd.DataFrame:
+    """Adds:
+       - TaxEff_account (0..1)
+       - TaxEff_note (short text for cards/tables)
+       - Tax Flag      (same note kept for legacy columns)
+    """
+    if df.empty:
+        out = df.copy()
+        out["TaxEff_account"] = 0.5
+        out["TaxEff_note"] = ""
+        out["TaxEff_flag"] = ""
+        out["Tax Flag"] = ""
+        return out
+
+    notes, scores = [], []
+    for _, r in df.iterrows():
+        n, s = _tax_flag_and_score(r, country, account_type)
+        notes.append(n); scores.append(s)
+
+    out = df.copy()
+
+    # make a Series (so we can use .fillna) and align it to the DataFrame index
+    scores_s = pd.Series(scores, index=out.index)
+    scores_s = pd.to_numeric(scores_s, errors="coerce").fillna(0.5).astype(float)
+
+    out["TaxEff_account"] = scores_s
+    out["TaxEff_note"] = notes              # short human text for UI
+    out["TaxEff_flag"] = ""                 # (kept for future short labels)
+    out["Tax Flag"] = notes                 # legacy column some tables expect
+    return out
+
+# ---- SAFE EXCEL READER (avoids "Permission denied") ----
+def safe_read_excel(path, sheet):
+    import tempfile, shutil, pandas as pd
+    try:
+        return pd.read_excel(path, sheet_name=sheet)
+    except PermissionError:
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            shutil.copyfile(path, tmp.name)
+            return pd.read_excel(tmp.name, sheet_name=sheet)
+
+
 # ---- Load ETF Data ----
 @st.cache_data
-def load_etf_data(use_new=USE_NEW_DATA, _excel_mtime=None, _csv_mtime=None):
+def load_etf_data(use_new=USE_NEW_DATA, _excel_mtime=None, _csv_mtime=None, _path=None, _sheet=None, _cache_key=None):
     """
     Loads ETF data from either the new Excel (preferred) or the legacy CSV,
     and normalizes column names to the legacy schema used throughout the app.
     """
     import pandas as pd
 
+    # Resolve which file/sheet to read for this call
+    path  = _path  if _path  else NEW_DATA_PATH
+    sheet = _sheet if _sheet else NEW_DATA_SHEET
+
     # --- 1) Load file
     if use_new:
         try:
-            df = pd.read_excel(NEW_DATA_PATH, sheet_name=NEW_DATA_SHEET)
+            # Try the requested sheet; if it fails or doesn't exist, use the first sheet
+            try:
+                df = safe_read_excel(path, sheet)
+            except Exception:
+                df = safe_read_excel(path, 0)
+
         except Exception as e:
-            st.warning(f"Could not read new Excel file ({NEW_DATA_PATH}). Falling back to legacy CSV. Error: {e}")
-            df = pd.read_csv(OLD_DATA_PATH)
-            df = df.rename(columns={"Total Assets ": "Total Assets"})
-    else:
-        df = pd.read_csv(OLD_DATA_PATH)
-        df = df.rename(columns={"Total Assets ": "Total Assets"})
+            st.error(f"Could not read Excel file ({path} @ {sheet}). Error: {e}")
+            # keep the app alive with an empty table that has the columns your app expects
+            df = pd.DataFrame(columns=[
+                "Symbol","ETF Name","1 Year","ER","Annual Dividend Yield %","Total Assets",
+                "Tags","Listing Country"
+            ])
 
         # --- SAFETY: if the reads somehow failed, keep the app alive with an empty table
     if 'df' not in locals() or df is None:
@@ -220,8 +384,9 @@ def load_etf_data(use_new=USE_NEW_DATA, _excel_mtime=None, _csv_mtime=None):
         "Fund Name": "ETF Name",
         "Assets": "Total Assets",
         "Exp. Ratio": "ER",
-        "Return 1Y": "1 Year",
-        "Div. Yield": "Annual Dividend Yield %",
+        # your exports use CAGR names, so map them:
+        "CAGR 1Y": "1 Year",
+        "Div. Yield": "Annual Dividend Yield %",  # if it ever appears
     }
     rename_actual = {k: v for k, v in rename_map_new_to_legacy.items() if k in df.columns}
     if rename_actual:
@@ -232,6 +397,10 @@ def load_etf_data(use_new=USE_NEW_DATA, _excel_mtime=None, _csv_mtime=None):
     for col in required_cols:
         if col not in df.columns:
             df[col] = None  # create empty column if missing
+
+
+    
+
 
     # Standardize types as strings; later code strips %/$ anyway
     for col in ["1 Year", "ER", "Annual Dividend Yield %", "Total Assets"]:
@@ -310,52 +479,51 @@ def load_etf_data(use_new=USE_NEW_DATA, _excel_mtime=None, _csv_mtime=None):
     df["Yield_num"] = _pct_series(df["Annual Dividend Yield %"])
     df["AUM_bil"]   = df["Total Assets"].apply(_aum_to_billions)
 
-    
-    
+    # Keep a raw copy for country inference (preserve TSX:, TSXV:, NEO:, etc.)
+    df["_SymbolRaw"] = df["Symbol"].astype(str)
 
-        # --- 4b) Add Listing Country using native columns first, then heuristics
-    exch_to_country = {
-        # USA exchanges
-        "NYSE": "USA", "NASDAQ": "USA", "NYSEARCA": "USA", "BATS": "USA",
-        "CBOE": "USA", "CBOE BZX": "USA", "CBOE BYX": "USA", "CBOE EDGX": "USA",
-        # Canada exchanges
-        "TSX": "Canada", "TSXV": "Canada", "TSX VENTURE": "Canada",
-        "NEO": "Canada", "CBOE CANADA": "Canada", "CSE": "Canada",
-        "CBOE NEO": "Canada"
-    }
 
-    # Start with an empty column
-    df["Listing Country"] = None
+    # --- 4b) Add Listing Country using native columns first, then heuristics
+    def _exchange_to_country(x: str):
+        s = str(x).strip().upper()
+        # USA clues
+        if any(k in s for k in ["NYSE", "NASDAQ", "NYSEARCA", "BATS", "CBOE", "EDGX", "BZX", "BYX"]):
+            return "USA"
+        # CANADA clues
+        if any(k in s for k in ["TSX", "TSXV", "TSX VENTURE", "NEO", "CBOE CANADA", "CSE", "TMX", "TORONTO STOCK"]):
+            return "Canada"
+        return None
 
-    # 1) If there's a Country column, use it (normalize)
-    if "Country" in df.columns:
+    # 1) If the file ALREADY has a proper "Listing Country" column, normalize and use it.
+    if "Listing Country" in df.columns:
         df["Listing Country"] = (
-            df["Country"].astype(str)
-              .str.strip()
-              .str.replace(r"\.0$", "", regex=True)
-              .map({"United States": "USA", "Canada": "Canada"})
-              .fillna(df["Country"])  # keep other values as-is (e.g., China)
+            df["Listing Country"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+            .replace({"United States": "USA", "U.S.": "USA", "US": "USA", "Canada": "Canada"})
         )
+    else:
+        # 2) Start from Exchange if present
+        if "Exchange" in df.columns:
+            df["Listing Country"] = df["Exchange"].apply(_exchange_to_country)
+        else:
+            df["Listing Country"] = None
 
-    # 2) Fill any blanks using Exchange mapping
-    if "Exchange" in df.columns:
+        # 3) Fallback: infer from the *raw* ticker (keeps TSX:/TSXV:/NEO: prefixes)
         df["Listing Country"] = df["Listing Country"].where(
             df["Listing Country"].notna(),
-            df["Exchange"].astype(str).str.strip().str.upper().map(exch_to_country)
+            df.apply(lambda r: infer_listing_country(r.get("_SymbolRaw", ""), r.get("ETF Name", ""), r.get("Tags", "")), axis=1)
         )
 
-    # 3) Any remaining blanks: fall back to ticker/name heuristics
-    def _infer(symbol, name="", tags=""):
-        # Use your existing helper
-        return infer_listing_country(symbol, name, tags)
+        # Finally normalize Symbol (remove exchange prefixes only after country is set)
+        df["Symbol"] = (
+            df["_SymbolRaw"]
+            .astype(str)
+            .str.replace(r"^[A-Z ]+?:", "", regex=True)
+            .str.strip()
+        )
 
-    df["Listing Country"] = df["Listing Country"].where(
-        df["Listing Country"].notna(),
-        df.apply(lambda r: _infer(r.get("Symbol", ""), r.get("ETF Name", ""), r.get("Tags", "")), axis=1)
-    )
-
-    # 4) Final tidy: Unknown if still empty
+    # Final tidy
     df["Listing Country"] = df["Listing Country"].fillna("Unknown")
+
 
     # --- 6) Compute Risk Level and return
     df["Risk Level"] = df.apply(classify_risk, axis=1)
@@ -368,15 +536,14 @@ def _mtime(path):
         return None
 
 
-
 # --- Data banner helper ---
-def _asof_label():
-    src = NEW_DATA_PATH if USE_NEW_DATA else OLD_DATA_PATH
-    try:
-        ts = dt.datetime.fromtimestamp(os.path.getmtime(src))
-        return f"{pathlib.Path(src).name} • {ts:%Y-%m-%d %H:%M} • {len(etf_df):,} rows"
-    except:
-        return f"{pathlib.Path(src).name} • {len(etf_df):,} rows"
+def _asof_label(rowcount=None, label="Dataset", ts=None):
+    """Build a simple banner label without exposing file paths."""
+    rows = rowcount if rowcount is not None else (len(etf_df) if 'etf_df' in globals() else 0)
+    if ts:
+        return f"{label} • {ts:%Y-%m-%d %H:%M} • {rows:,} rows"
+    return f"{label} • {rows:,} rows"
+
 
 # ---- Multi-Factor ETF Scoring Engine ----
 def normalize(series):
@@ -416,10 +583,69 @@ def safe_goal_filter(df, goal):
     if goal == "Wealth Growth":return df[r > 6]
     return df
 
+def _account_tax_multiplier(row, country, account_type):
+    """
+    Returns a multiplicative factor (e.g., 0.95 … 1.05) that nudges the Final Score
+    based on simple account-aware tax rules.
+
+    Keep it LIGHT: we already hard-include/exclude in get_country_policy().
+    This only provides gentle preference where both choices remain.
+    """
+    try:
+        lst_country = str(row.get("Listing Country", "") or "")
+        asset_class = str(row.get("Simplified Asset Class", "") or "").lower()
+        yld = float(row.get("Yield_clean", 0) or 0)   # already in percent scale
+        er  = float(row.get("ER_clean", 0) or 0)
+
+        # Default: neutral
+        mult = 1.00
+
+        # ---- CANADA rules ----
+        if country == "Canada":
+            # TFSA / RESP: distributions unrecoverably taxed from US-listed — but we already exclude most via policy.
+            # Give a mild boost to CAD-listed equities that have modest yield (keeping taxes simple).
+            if account_type in {"TFSA", "RESP"}:
+                if asset_class == "equity" and lst_country == "Canada":
+                    if yld <= 2.0:
+                        mult += 0.02  # favor CAD-listed, low-ish distribution equities in TFSA/RESP
+
+            # RRSP: US dividends from US-listed are generally treaty-exempt; nudge US-listed equity slightly
+            elif account_type == "RRSP":
+                if asset_class == "equity" and lst_country == "USA":
+                    mult += 0.03
+
+            # Non-Registered: favor lower distributions (tax drag) and lower ER
+            elif account_type == "Non-Registered":
+                if asset_class in {"equity", "bond"}:
+                    if yld <= 2.0:  # lower distribution = less tax drag
+                        mult += 0.02
+                    if er <= 0.25:
+                        mult += 0.01
+
+        # ---- USA rules ----
+        elif country == "USA":
+            # Taxable: favor lower yield & lower ER (tax efficiency)
+            if account_type == "Taxable":
+                if asset_class in {"equity", "bond"}:
+                    if yld <= 1.8:
+                        mult += 0.02
+                    if er <= 0.10:
+                        mult += 0.01
+            # Roth IRA / 401(k) / Traditional IRA: growth > distributions
+            elif account_type in {"Roth IRA", "401(k)", "Traditional IRA"}:
+                if asset_class == "equity":
+                    if yld <= 1.5:
+                        mult += 0.02  # prefer growth-oriented, low distribution
+
+        # Clamp multiplier to a safe band so nudges stay small
+        return max(0.90, min(1.08, mult))
+    except Exception:
+        return 1.00
+
 def rank_etfs(df, goal):
     df = df.copy()
 
-        # Prefer precomputed numeric columns if present
+    # Prefer precomputed numeric columns if present
     df["1Y_clean"]    = df.get("1Y_num",    pd.to_numeric(df["1 Year"].astype(str).str.replace('%','', regex=False), errors="coerce"))
     df["ER_clean"]    = df.get("ER_num",    pd.to_numeric(df["ER"].astype(str).str.replace('%','', regex=False), errors="coerce"))
     df["Yield_clean"] = df.get("Yield_num", pd.to_numeric(df["Annual Dividend Yield %"].astype(str).str.replace('%','', regex=False), errors="coerce"))
@@ -428,13 +654,23 @@ def rank_etfs(df, goal):
         errors="coerce"
     ))
 
-    # Zero-division safe tax-efficiency
-    denom = (df["Yield_clean"].fillna(0) + df["ER_clean"].fillna(0)).replace(0, pd.NA)
-    TaxEff = 1 / denom
-    TaxEff = pd.to_numeric(TaxEff, errors="coerce")
-    TaxEff.replace([float("inf"), float("-inf")], pd.NA, inplace=True)
-    df["TaxEff_clean"] = TaxEff
 
+    # Account-aware tax-efficiency (0..1), plus a short flag
+    if st.session_state.get("use_account_tax", True):
+        # Use the account-aware tax signal
+        df = add_account_tax_scores(
+            df,
+            country=st.session_state.get("country", ""),
+            account_type=st.session_state.get("use_context", "")
+        )
+        df["TaxEff_clean"] = df["TaxEff_account"]
+    else:
+        # Fall back to the old simple proxy (1 / (yield + ER))
+        denom = (df["Yield_clean"].fillna(0) + df["ER_clean"].fillna(0)).replace(0, pd.NA)
+        TaxEff = 1 / denom
+        TaxEff = pd.to_numeric(TaxEff, errors="coerce")
+        TaxEff.replace([float("inf"), float("-inf")], pd.NA, inplace=True)
+        df["TaxEff_clean"] = TaxEff
 
 
     # Normalize
@@ -452,6 +688,16 @@ def rank_etfs(df, goal):
         weights["Yield"] * df["Yield_score"] +
         weights["TaxEff"] * df["TaxEff_score"]
     )
+
+    # ★ Apply account-aware tax nudges automatically (no checkbox)    
+    country = st.session_state.get("country", "")
+    acct    = st.session_state.get("use_context", "")
+    if country and acct:
+        df["Final Score"] = df.apply(
+            lambda r: r["Final Score"] * _account_tax_multiplier(r, country, acct),
+            axis=1
+        )
+
     return df
 
 # --- Helper: ranked candidates for one asset class (same logic as the UI tabs) ---
@@ -557,8 +803,8 @@ def keep_one_per_bucket(df, name_col="ETF Name", max_per_bucket=1):
 
 # ---- App Tabs ----
 # ---- Add Custom ETF Lists Tab ----
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Portfolio Builder", "ETF Screener", "Portfolio Analyzer", "Rebalancing Checker", "Custom ETF Lists"
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "Portfolio Builder", "ETF Screener", "Portfolio Analyzer", "Rebalancing Checker", "Custom ETF Lists", "Advisor Notes"
 ])
 
 # --- Sidebar: Client Profile ---
@@ -569,19 +815,61 @@ with st.sidebar:
     # Choose which Excel to use
     dataset_choice = st.radio(
         "Dataset file",
-        ["Auto (match Country)", "US ETFs", "CA ETFs"],
+        ["Auto (match Country)", "US ETFs", "CA ETFs", "All (US+CA)"],
         index=0,
         help="Auto uses the Country picker below to choose the file."
     )
 
+    # Keep country in session
+    if "country" not in st.session_state:
+        st.session_state["country"] = ""
+
+    # Let the user pick Country when using "Auto"
+    # (we keep it visible always — harmless if they also switch to US/CA radio)
+    st.session_state["country"] = st.selectbox(
+        "Country",
+        ["", "Canada", "USA"],   # "" = none selected yet
+        index=["", "Canada", "USA"].index(st.session_state.get("country",""))
+    )
+
+
+    # Auto-set the country when a single-region dataset is chosen
+    if dataset_choice == "US ETFs" and st.session_state.get("country","") != "USA":
+        st.session_state["country"] = "USA"
+        st.rerun()
+    elif dataset_choice == "CA ETFs" and st.session_state.get("country","") != "Canada":
+        st.session_state["country"] = "Canada"
+        st.rerun()
+    elif dataset_choice == "All (US+CA)":
+        # Show BOTH countries: clear any country/account filters
+        if st.session_state.get("country","") or st.session_state.get("use_context",""):
+            st.session_state["country"] = ""
+            st.session_state["use_context"] = ""
+            st.rerun()
+
+        # 2C — quick existence checks (show errors if either file is missing)
+        if not os.path.exists(US_DATA_PATH):
+            st.error(f"Missing US data file: {US_DATA_PATH}")
+        if not os.path.exists(CA_DATA_PATH):
+            st.error(f"Missing CA data file: {CA_DATA_PATH}")
+
+    country = st.session_state.get("country", "")
+
+
+
     # Allow blank ("None") as default option for more flexibility
-    country = st.selectbox("Select Country", ["", "Canada", "USA"], index=0)
+    country_options = ["", "Canada", "USA"]
 
     account_type_options = {
         "Canada": ["", "TFSA", "RRSP", "RESP", "Non-Registered", "Institutional"],
         "USA": ["", "Roth IRA", "401(k)", "Traditional IRA", "Taxable", "Institutional"]
     }
-    account_type = st.selectbox("Account Type", account_type_options.get(country, [""]), index=0)
+    
+    account_type = st.selectbox(
+        "Account Type",
+        account_type_options.get(st.session_state.get("country", ""), [""]),
+        index=0
+    )
 
     # Rules engine with fallback behavior for blanks
     context_rules = {
@@ -618,18 +906,27 @@ with st.sidebar:
         ("Canada", "RESP"): {"note": "🎓 RESP use — educational investment preferences apply."},
     }
 
-    rules_key = (country, account_type)
+    rules_key = (st.session_state.get("country", ""), account_type)
     rules_applied = context_rules.get(rules_key, {})
 
     st.session_state["use_context"] = account_type
-    st.session_state["country"] = country
     st.session_state["use_context_rules"] = rules_applied
     st.session_state["use_context_note"] = rules_applied.get("note", "")
+    
+    # Friendly notice so users know tax-aware ranking is active
+    if st.session_state.get("country", "") and account_type:
+        st.caption(f" Tax-aware ranking applied for **{st.session_state['country']} – {account_type}**.")
+    else:
+        st.caption(" Tax-aware ranking: set Country and Account Type to enable.")
 
     # --- Quick data sanity check (optional) ---
     if st.checkbox("Show data sanity check", key="dbg_assetclass"):
-        st.write("Row count:", len(etf_df))
-        st.write(etf_df["Simplified Asset Class"].value_counts(dropna=False))
+        if _has_etf_data():
+            st.write("Row count:", len(etf_df))
+            st.write(etf_df["Simplified Asset Class"].value_counts(dropna=False))
+        else:
+            st.info("Load data first.")
+
 
     # Risk questionnaire logic (unchanged)
     if "show_risk_quiz" not in st.session_state:
@@ -704,6 +1001,9 @@ with st.sidebar:
     notes = st.text_area("Meeting Notes")
 
     with st.expander("Advanced: scoring weights"):
+
+        st.session_state["use_account_tax"] = True
+
         w_1y = st.slider("1Y performance", 0.0, 0.6, 0.30 if goal=="Wealth Growth" else 0.20, 0.05, key="w1y")
         w_er = st.slider("Expense ratio",   0.0, 0.6, 0.20, 0.05, key="wer")
         w_aum = st.slider("AUM size",       0.0, 0.6, 0.10, 0.05, key="waum")
@@ -714,36 +1014,172 @@ with st.sidebar:
             "1Y": w_1y/tot, "ER": w_er/tot, "AUM": w_aum/tot, "Yield": w_yld/tot, "TaxEff": w_tax/tot
         }
 
-        # NEW: reset weights to FundMentor defaults
-        if st.button("Reset weights to defaults", key="w_reset"):
-            st.session_state["w1y"] = 0.30 if goal=="Wealth Growth" else 0.20
-            st.session_state["wer"] = 0.20
-            st.session_state["waum"] = 0.10
-            st.session_state["wyld"] = 0.10 if goal=="Wealth Growth" else 0.20
-            st.session_state["wtax"] = 0.30
-            st.session_state.pop("weights_override", None)
-            # If this errors on your Streamlit version, replace with st.rerun()
-            st.experimental_rerun()
+    use_account_tax = st.checkbox(
+        "Use account-aware tax scoring",
+        value=True,
+        help="Factor in listing country, account type, and yield to rank tax efficiency."
+    )
+    st.session_state["use_account_tax"] = use_account_tax
 
-        # Decide which Excel to open based on dataset_choice + Country
-        if dataset_choice == "US ETFs" or (dataset_choice.startswith("Auto") and country == "USA"):
-            NEW_DATA_PATH = US_DATA_PATH
-            NEW_DATA_SHEET = US_DATA_SHEET
-        elif dataset_choice == "CA ETFs" or (dataset_choice.startswith("Auto") and country == "Canada"):
-            NEW_DATA_PATH = CA_DATA_PATH
-            NEW_DATA_SHEET = CA_DATA_SHEET
+    # Decide which Excel(s) to load (no file path shown to the user)
+    dataset_label, dataset_ts = "US ETFs", None
+
+    if dataset_choice == "US ETFs" or (dataset_choice.startswith("Auto") and st.session_state.get("country", "") == "USA"):
+
+        # Lock the "current" dataset pointers to the US file/sheet
+        dataset_label = "US ETFs"
+        NEW_DATA_PATH, NEW_DATA_SHEET = US_DATA_PATH, US_DATA_SHEET
+        if not os.path.exists(NEW_DATA_PATH):
+            st.error(f"Missing data file: {NEW_DATA_PATH}")
+            etf_df = pd.DataFrame()
         else:
-            NEW_DATA_PATH = DEFAULT_DATA_PATH
-            NEW_DATA_SHEET = DEFAULT_DATA_SHEET
+            etf_df = load_etf_data(
+                _excel_mtime=_mtime(NEW_DATA_PATH),
+                _path=NEW_DATA_PATH,
+                _sheet=NEW_DATA_SHEET,
+                _cache_key=f"US::{_mtime(US_DATA_PATH)}::{US_DATA_SHEET}"
+            )
+        st.caption("Listing Country counts: " + str(dict(etf_df["Listing Country"].value_counts(dropna=False).to_dict())))
 
-        # Now load the data for the selected file
-        etf_df = load_etf_data(
-            _excel_mtime=_mtime(NEW_DATA_PATH),   # cache-busts per file
-            _csv_mtime=_mtime(OLD_DATA_PATH),
+
+    elif dataset_choice == "CA ETFs" or (dataset_choice.startswith("Auto") and st.session_state.get("country", "") == "Canada"):
+
+        # Lock the "current" dataset pointers to the CA file/sheet
+        dataset_label = "CA ETFs"
+        NEW_DATA_PATH, NEW_DATA_SHEET = CA_DATA_PATH, CA_DATA_SHEET
+
+        if not os.path.exists(NEW_DATA_PATH):
+            st.error(f"Missing data file: {NEW_DATA_PATH}")
+            etf_df = pd.DataFrame()
+        else:
+            etf_df = load_etf_data(
+                _excel_mtime=_mtime(NEW_DATA_PATH),
+                _path=NEW_DATA_PATH,
+                _sheet=NEW_DATA_SHEET,
+                _cache_key=f"CA::{_mtime(CA_DATA_PATH)}::{CA_DATA_SHEET}"
+            )
+
+
+        # === Sanity: show rows loaded or the exact problem ===
+        if etf_df is None or etf_df.empty:
+            st.error(f"{dataset_label}: 0 rows loaded. Check file exists and sheet has data.\n"
+                     f"Path: {NEW_DATA_PATH}\nSheet: {NEW_DATA_SHEET}")
+        else:
+            st.success(f"{dataset_label}: {len(etf_df):,} rows loaded.")
+
+
+    elif dataset_choice == "All (US+CA)":
+        dataset_label = "All (US+CA)"
+        # Load both and combine; clear NEW_DATA_* so later reloads don't assume a single file
+        us_df = load_etf_data(
+            _excel_mtime=_mtime(US_DATA_PATH),
+            _path=US_DATA_PATH,
+            _sheet=US_DATA_SHEET,
+            _cache_key=f"US::{_mtime(US_DATA_PATH)}::{US_DATA_SHEET}"
         )
+        st.info(f"US rows loaded: {len(us_df):,}")
 
-        # Show the banner *after* loading, so it reports the correct file & row count
-        st.sidebar.caption(f"Data as of: {_asof_label()}")
+        ca_df = load_etf_data(
+            _excel_mtime=_mtime(CA_DATA_PATH),
+            _path=CA_DATA_PATH,
+            _sheet=CA_DATA_SHEET,
+            _cache_key=f"CA::{_mtime(CA_DATA_PATH)}::{CA_DATA_SHEET}"
+        )
+        st.info(f"CA rows loaded: {len(ca_df):,}")
+
+        etf_df = pd.concat([us_df, ca_df], ignore_index=True)
+        st.info(f"Combined (before de-dupe): {len(etf_df):,}")
+
+        if {"Symbol", "ETF Name"}.issubset(etf_df.columns):
+            etf_df = etf_df.drop_duplicates(subset=["Symbol", "ETF Name", "Listing Country"])
+            st.info(f"After de-dupe on Symbol+Name: {len(etf_df):,}")
+
+            st.caption("Listing Country counts: " + str(dict(etf_df["Listing Country"].value_counts(dropna=False).to_dict())))
+
+        else:
+            st.warning("Cannot de-duplicate: missing 'Symbol' or 'ETF Name' column.")
+
+        NEW_DATA_PATH, NEW_DATA_SHEET = None, None  # prevent later single-file reloads
+
+        # banner timestamp = newer of the two files
+        t_us, t_ca = _mtime(US_DATA_PATH), _mtime(CA_DATA_PATH)
+        newer = max([t for t in [t_us, t_ca] if t is not None], default=None)
+        dataset_label = "All (US+CA)"
+        dataset_ts = dt.datetime.fromtimestamp(newer) if newer else None
+
+        # === Sanity: show rows loaded or the exact problem ===
+        if etf_df is None or etf_df.empty:
+            st.error(f"{dataset_label}: 0 rows loaded. Check file exists and sheet has data.\n"
+                     f"US Path: {US_DATA_PATH}\nCA Path: {CA_DATA_PATH}\nSheet: Export")
+        else:
+            st.success(f"{dataset_label}: {len(etf_df):,} rows loaded.")
+
+
+    else:
+        # Fallback: default to US dataset
+        NEW_DATA_PATH, NEW_DATA_SHEET = US_DATA_PATH, US_DATA_SHEET
+        etf_df = load_etf_data(
+            _excel_mtime=_mtime(NEW_DATA_PATH),
+            _path=NEW_DATA_PATH,
+            _sheet=NEW_DATA_SHEET,
+        )
+        
+    st.caption("Listing Country counts: " + str(dict(etf_df["Listing Country"].value_counts(dropna=False).to_dict())))
+
+    if dataset_choice == "All (US+CA)":
+        # keep the label/timestamp set earlier in that branch
+        pass
+    else:
+        t = _mtime(NEW_DATA_PATH)
+        dataset_label = dataset_label if 'dataset_label' in locals() else "US ETFs"
+        dataset_ts = dt.datetime.fromtimestamp(t) if t else None
+
+    # === Sanity: show rows loaded or the exact problem ===
+    if etf_df is None or etf_df.empty:
+        st.error(f"{dataset_label}: 0 rows loaded. Check file exists and sheet has data.\n"
+                f"Path: {NEW_DATA_PATH}\nSheet: {NEW_DATA_SHEET}")
+    else:
+        st.success(f"{dataset_label}: {len(etf_df):,} rows loaded.")
+
+    # Show the banner AFTER etf_df exists (no file name or path shown)
+    st.caption(f"Data as of: {_asof_label(len(etf_df), label=dataset_label, ts=dataset_ts)}")
+    st.sidebar.caption(f"Data as of: {_asof_label(len(etf_df), label=dataset_label, ts=dataset_ts)}")
+    with st.expander("🔎 Debug — what did we actually load?", expanded=False):
+        st.write({
+            "dataset_choice": dataset_choice,
+            "country_session": st.session_state.get("country"),
+            "account_type": st.session_state.get("use_context"),
+            "rows_loaded": len(etf_df),
+            "first_8_cols": list(etf_df.columns)[:8]
+        })
+        st.caption(f"US path: {US_DATA_PATH}")
+        st.caption(f"CA path: {CA_DATA_PATH}")
+        try:
+            st.write("Listing Country counts:", etf_df["Listing Country"].value_counts(dropna=False).to_dict())
+        except Exception:
+            st.write("No 'Listing Country' column yet.")
+        if st.button("Clear data cache and reload"):
+            st.cache_data.clear()
+            st.rerun()
+
+        # ✅ Not an expander — just a toggle to reveal the sample
+        show_sample = st.checkbox("Show quick country sanity sample", value=False, key="dbg_country_sample")
+        if show_sample:
+            try:
+                n = min(15, len(etf_df))
+                if n > 0:
+                    st.write(etf_df.sample(n)[["Symbol","ETF Name","Listing Country"]])
+                else:
+                    st.caption("No data loaded yet.")
+            except Exception as e:
+                st.caption(f"(Could not sample: {e})")
+
+
+    try:
+        mix = etf_df["Listing Country"].value_counts().to_dict()
+        st.sidebar.caption("Loaded rows: " + f"{len(etf_df):,}" + " • Country mix: " + ", ".join(f"{k}:{v}" for k,v in mix.items()))
+    except Exception:
+        pass
 
 
 # ---- Portfolio Builder Tab ----
@@ -818,8 +1254,14 @@ with tab1:
     min_score = st.slider("Min score to include", 0.00, 1.00, 0.00, 0.05, help="Skip very weak candidates.")
     include_mixed_as_core = st.checkbox("Allow a single Mixed fund to replace Equity/Bonds/Cash if it scores very high", value=False, help="If enabled and a top Mixed ETF scores ≥ chosen threshold, it will be used as a one-ticket core.")
 
+    relax_builder = st.checkbox(
+        "If a sleeve is empty, relax risk (keep country/account rules)",
+        value=True
+    )
+
     if st.button("Generate model portfolio"):
         rows = []
+    
 
         # Optional: replace the whole core with one Mixed ETF if enabled and strong enough
         if include_mixed_as_core:
@@ -835,6 +1277,44 @@ with tab1:
                 ranked = get_ranked_for_class(ac, goal, risk, st.session_state.get("country",""), st.session_state.get("use_context",""), etf_df, risk_filters)
                 ranked = ranked[ranked["Final Score"] >= min_score]
                 ranked = keep_one_per_bucket(ranked)
+                if ranked.empty and relax_builder:
+                    # Rebuild base set = same asset class, with country/account rules applied
+                    base = etf_df[etf_df["Simplified Asset Class"].str.lower() == asset_mapping[ac]].copy()
+
+                    # Apply country/account policy (same as tabs)
+                    policy = get_country_policy(
+                        st.session_state.get("country", ""),
+                        st.session_state.get("use_context", ""),
+                        ac
+                    )
+                    if policy["hard_include"]:
+                        base = base[base["Listing Country"].isin(policy["hard_include"])]
+                    if policy["hard_exclude"]:
+                        base = base[~base["Listing Country"].isin(policy["hard_exclude"])]
+
+                    # Apply the same context rules (avoid_us_dividends, etc.)
+                    rules = st.session_state.get("use_context_rules") or {}
+                    if rules.get("avoid_us_dividends"):
+                        base = base[base["Listing Country"].ne("USA")]
+                    if rules.get("avoid_dividends"):
+                        base = base[pd.to_numeric(base["Annual Dividend Yield %"].str.replace("%",""), errors="coerce") < 2]
+                    if rules.get("favor_tax_efficiency"):
+                        base = base[
+                            (pd.to_numeric(base["Annual Dividend Yield %"].str.replace("%",""), errors="coerce") < 2.5) &
+                            (pd.to_numeric(base["ER"].str.replace("%",""), errors="coerce") < 0.3)
+                        ]
+                    if rules.get("favor_growth"):
+                        base = base[pd.to_numeric(base["1 Year"].str.replace("%",""), errors="coerce") > 5]
+                    if rules.get("favor_low_fee"):
+                        base = base[pd.to_numeric(base["ER"].str.replace("%",""), errors="coerce") < 0.25]
+
+                    # Keep equity goal filter; relax only risk
+                    if ac == "Equity":
+                        base = safe_goal_filter(base, goal)
+
+                    ranked = rank_etfs(base, goal).sort_values("Final Score", ascending=False)
+                    ranked = keep_one_per_bucket(ranked)
+
                 if ranked.empty:
                     continue
                 take = ranked.head(etfs_per_class)
@@ -1032,6 +1512,8 @@ with tab1:
 ### How to implement (ETFs & dollars)
 {tickers_block}
 
+
+
 ### Next steps / caveats
 - This is a starting point, not personal advice. Markets change; rebalance and review annually or after big life changes.
 - Fees and taxes matter. Lower fees and tax efficiency generally help long-term outcomes.
@@ -1060,6 +1542,11 @@ with tab1:
         with tab:
             st.markdown(f"### {asset_class} ETF Recommendations")
             class_key = asset_mapping[asset_class]
+
+            # If data isn't loaded, show a friendly note and skip this tab render
+            if etf_df.empty:
+                st.info("ETF data not loaded yet — pick dataset/country in the sidebar.")
+                continue
 
             filtered = etf_df[
                 (etf_df["Simplified Asset Class"].str.lower() == class_key)
@@ -1100,43 +1587,45 @@ with tab1:
             if rules.get("favor_low_fee"):
                 filtered = filtered[pd.to_numeric(filtered["ER"].str.replace("%", ""), errors="coerce") < 0.25]
 
-            # ---- one risk/goal filter pass (gentle on bonds & cash) ----
+            # Save a copy after country/account policy + context rules (before risk/goal filters)
+            base_after_rules = filtered.copy()
+
+            # ---- one risk/goal filter pass (STRICT) ----
+            filtered_final = base_after_rules.copy()
+
             if asset_class != "Other":
                 allowed = set(risk_filters[risk])
                 if asset_class in ["Bonds", "Cash"]:
-                    allowed.update({"Low", "Medium"})  # don't over-prune safe stuff
-                filtered = filtered[filtered["Risk Level"].isin(allowed)]
+                    allowed.update({"Low", "Medium"})  # keep safer choices in FI/cash
+                filtered_final = filtered_final[filtered_final["Risk Level"].isin(allowed)]
 
-            # goal thresholds are for equities; don’t shrink bonds/cash with them
+            # Goal thresholds apply to equities only
             if asset_class == "Equity":
-                filtered = safe_goal_filter(filtered, goal)
-        
+                filtered_final = safe_goal_filter(filtered_final, goal)
 
-            st.caption(f"{len(filtered)} ETFs match the filters for this asset class and goal.")
+            # Count AFTER strict filters (this is what we try to show)
+            st.caption(f"{len(filtered_final)} ETFs match the current filters.")
 
-            if st.session_state.get("use_context_note"):
-                st.caption(st.session_state["use_context_note"])
-            elif not st.session_state.get("country") or not st.session_state.get("use_context"):
-                st.caption("📌 No account-specific filtering applied.")
+            # Rank strict result
+            ranked_df = rank_etfs(filtered_final, goal).sort_values(by="Final Score", ascending=False)
 
-            ranked_df = rank_etfs(filtered, goal)
-            ranked_df = ranked_df.sort_values(by="Final Score", ascending=False)
-
-            # ---- Soft preference nudges (apply after scoring) ----
-            boosts = policy.get("score_boost", {})
-            if boosts and "Listing Country" in ranked_df.columns:
-                for (lst_country, ac), factor in boosts.items():
-                    if asset_class == ac:
-                        ranked_df.loc[ranked_df["Listing Country"] == lst_country, "Final Score"] *= float(factor)
-                ranked_df = ranked_df.sort_values(by="Final Score", ascending=False)
-
-            
-            # If totally empty after filters, switch to a relaxed fallback and still show tiers
+            # ---- Fallback: RELAX **RISK ONLY** (keep country/account rules & equity goal) ----
             if ranked_df.empty:
-                relax = etf_df[etf_df["Simplified Asset Class"].str.lower() == class_key].copy()
-                if not relax.empty:
-                    ranked_df = rank_etfs(relax, goal).sort_values(by="Final Score", ascending=False).head(12)
-                    st.warning("No ETFs matched after filters. Showing top options for this asset class without risk filtering.")
+                relaxed = base_after_rules.copy()  # country/account rules still applied
+                if asset_class == "Equity":
+                    relaxed = safe_goal_filter(relaxed, goal)  # keep the equity goal filter
+                if not relaxed.empty:
+                    ranked_df = (
+                        rank_etfs(relaxed, goal)
+                        .sort_values(by="Final Score", ascending=False)
+                        .head(12)
+                    )
+                    st.warning(
+                        "No ETFs matched after the **risk** filter. "
+                        "Showing top options with risk relaxed (country/account rules still applied)."
+                    )
+
+
 
             if ranked_df.empty:
                 st.info("No ETFs available after filtering.")
@@ -1181,44 +1670,66 @@ with tab1:
                     st.markdown("### Tier 1 ETFs - (highest rated)")
                     top_3 = tier_1.head(3)
                     for _, row in top_3.iterrows():
-                        one_year = row.get("1Y_clean", row.get("1 Year"))
-                        er = row.get("ER_clean", row.get("ER"))
-                        yld = row.get("Yield_clean", row.get("Annual Dividend Yield %"))
-                        aum_bil = row.get("AUM_clean", None)
+                                one_year = row.get("1Y_clean", row.get("1 Year"))
+                                er = row.get("ER_clean", row.get("ER"))
+                                yld = row.get("Yield_clean", row.get("Annual Dividend Yield %"))
+                                aum_bil = row.get("AUM_clean", None)
 
-                        # --- WHY THIS ETF (top two contributors) ---
-                        weights_here = get_factor_weights(goal)
-                        contrib = {
-                            "1Y":   weights_here["1Y"]   * row.get("1Y_score", 0),
-                            "ER":   weights_here["ER"]   * row.get("ER_score", 0),
-                            "AUM":  weights_here["AUM"]  * row.get("AUM_score", 0),
-                            "Yield":weights_here["Yield"]* row.get("Yield_score", 0),
-                            "Tax":  weights_here["TaxEff"]*row.get("TaxEff_score", 0),
-                        }
-                        top2 = sorted(contrib.items(), key=lambda kv: kv[1], reverse=True)[:2]
-                        why = " + ".join([f"{k}↑" for k,_ in top2]) if top2 else "—"
+                                # --- WHY THIS ETF (top two contributors) ---
+                                weights_here = get_factor_weights(goal)
+                                contrib = {
+                                    "1Y":   weights_here["1Y"]    * row.get("1Y_score", 0),
+                                    "ER":   weights_here["ER"]    * row.get("ER_score", 0),
+                                    "AUM":  weights_here["AUM"]   * row.get("AUM_score", 0),
+                                    "Yield":weights_here["Yield"] * row.get("Yield_score", 0),
+                                    "Tax":  weights_here["TaxEff"]* row.get("TaxEff_score", 0),
+                                }
+                                top2 = sorted(contrib.items(), key=lambda kv: kv[1], reverse=True)[:2]
+                                why = " + ".join([f"{k}↑" for k,_ in top2]) if top2 else "—"
 
-                        st.markdown(f"""
-                        <div style='background:#eef9f2; padding:15px; border-radius:10px; border:1px solid #b6e5c5; margin-bottom:15px;'>
-                            <b><a href='https://finance.yahoo.com/quote/{row['Symbol']}' target='_blank'>{row['Symbol']}: {row['ETF Name']}</a></b><br>
-                            <b>1Y Return:</b> {_fmt_pct(one_year)} &nbsp; <b>Expense Ratio:</b> {_fmt_pct(er)} &nbsp; <b>Yield:</b> {_fmt_pct(yld)}<br>
-                            <b>AUM:</b> {_fmt_bil(aum_bil)} &nbsp; <b>Risk Level:</b> {row['Risk Level']}<br>
-                            <b>Score:</b> {row['Final Score']:.2f} &nbsp; <b>Why:</b> {why}
-                        </div>
-                        """, unsafe_allow_html=True)
+                                # --- TAX FLAG / NOTE (comes from add_account_tax_scores) ---
+                                tax_flag = str(row.get("TaxEff_flag", "") or "").strip()   # e.g., "TFSA-inefficient", "RRSP-friendly"
+                                tax_note = str(row.get("TaxEff_note", "") or "").strip()   # short human text
+                                tax_badge = f"<span style='background:#fff3cd; color:#8a6d3b; padding:2px 6px; border-radius:999px; font-size:12px; border:1px solid #f7e49c; margin-left:6px;'>{tax_flag}</span>" if tax_flag else ""
 
+                                def _fmt_pct(x):
+                                    try: return f"{float(x):.2f}%"
+                                    except: return "—"
+                                def _fmt_bil(x):
+                                    try: return f"${float(x):.2f}B"
+                                    except: return "—"
+
+                                st.markdown(f"""
+                                <div style='background:#eef9f2; padding:15px; border-radius:10px; border:1px solid #b6e5c5; margin-bottom:15px;'>
+                                    <b><a href='https://finance.yahoo.com/quote/{row['Symbol']}' target='_blank'>{row['Symbol']}: {row['ETF Name']}</a></b>
+                                    {tax_badge}<br>
+                                    <b>1Y Return:</b> {_fmt_pct(one_year)} &nbsp; <b>Expense Ratio:</b> {_fmt_pct(er)} &nbsp; <b>Yield:</b> {_fmt_pct(yld)}<br>
+                                    <b>AUM:</b> {_fmt_bil(aum_bil)} &nbsp; <b>Risk Level:</b> {row['Risk Level']}<br>
+                                    <b>Score:</b> {row['Final Score']:.2f} &nbsp; <b>Why:</b> {why}
+                                    {"<br><b>Tax note:</b> " + tax_note if tax_note else ""}
+                                </div>
+                                """, unsafe_allow_html=True)
 
                     st.markdown("**Full Tier 1 Comparison Table**")
-                    st.dataframe(
-                        tier_1[["Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", "Total Assets", "Risk Level"]]
-                        .rename(columns={
-                            "1 Year": "1Y Return",
-                            "ER": "Expense Ratio",
-                            "Annual Dividend Yield %": "Yield",
-                            "Total Assets": "AUM"
-                        }),
-                        use_container_width=True
-                    )    
+                    cols = ["Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", "Total Assets", "Risk Level"]
+                    # Append Tax note/flag if present
+                    if "TaxEff_note" in tier_1.columns:
+                        cols.append("TaxEff_note")
+                    if "TaxEff_flag" in tier_1.columns and "TaxEff_flag" not in cols:
+                        cols.append("TaxEff_flag")
+
+                    table_1 = tier_1[ [c for c in cols if c in tier_1.columns] ].rename(columns={
+                        "1 Year": "1Y Return",
+                        "ER": "Expense Ratio",
+                        "Annual Dividend Yield %": "Yield",
+                        "Total Assets": "AUM",
+                        "TaxEff_note": "Tax note",
+                        "TaxEff_flag": "Tax flag"
+                    })
+                    st.dataframe(table_1, use_container_width=True)
+
+                    st.caption("ℹ️ Tax badge & note are based on your Country + Account Type (e.g., TFSA vs RRSP, Roth vs Taxable) and the ETF’s listing & yield profile.")
+
 
                 if not tier_2.empty:
                     st.markdown("### Tier 2 ETFs (Strong Alternatives)")
@@ -1256,7 +1767,7 @@ with tab2:
     selected_risk = st.selectbox("Filter by Risk Level", risk_options, key="scr_risk")
     keyword = st.text_input("Search by Symbol or Name", key="scr_keyword")
 
-    # NEW: one-click reset for screener filters
+    # one-click reset for screener filters
     if st.button("Reset screener filters", key="scr_reset"):
         st.session_state["scr_asset_class"] = "All"
         st.session_state["scr_risk"] = "All"
@@ -1264,10 +1775,11 @@ with tab2:
         st.session_state["scr_exlev"] = True
         st.success("Screener filters reset.")
 
-    # start from master df
+    # start from master df (MAKE THIS FIRST!)
     screener_df = etf_df.copy()
+    raw_count = len(screener_df)
 
-    # 5b(i) Safety: ensure "Listing Country" exists so filtering never crashes
+    # Ensure Listing Country exists
     if "Listing Country" not in screener_df.columns:
         if "Listing Country" in etf_df.columns:
             screener_df["Listing Country"] = etf_df["Listing Country"]
@@ -1280,12 +1792,25 @@ with tab2:
             )
     screener_df["Listing Country"] = screener_df["Listing Country"].fillna("Unknown")
 
-    # 5b(ii) Apply country filter from the sidebar only when chosen
-    if country in ("USA", "Canada"):
-        screener_df = screener_df[screener_df["Listing Country"] == country]
-        st.caption(f"Active country filter: {country}")
+    # Single checkbox to apply country filter (uses the sidebar country)
+    apply_country_filter = st.checkbox(
+        "Filter by listing country (from sidebar)",
+        value=(dataset_choice != "All (US+CA)"),
+        key="scr_country_filter"
+    )
+
+
+    # Use the sidebar 'country' value ("USA" / "Canada" / "")
+    country_current = st.session_state.get("country", "")
+    if apply_country_filter and country_current in ("USA", "Canada"):
+        screener_df = screener_df[screener_df["Listing Country"] == country_current]
+        st.caption(f"Active country filter: {country_current}")
     else:
         st.caption("Active country filter: All")
+
+
+    after_country_count = len(screener_df)
+
 
     # Asset class filter
     if selected_asset_class != "All":
@@ -1303,19 +1828,22 @@ with tab2:
             screener_df["ETF Name"].str.contains(keyword, case=False, na=False) |
             screener_df["Symbol"].str.contains(keyword, case=False, na=False)
         ]
-    
+
     # Optional safety screen
-    ex_lev = st.checkbox("Exclude leveraged/inverse/ETNs/option overlays", value=True, key="scr_exlev")
+    ex_lev = st.checkbox(
+        "Exclude leveraged/inverse/ETNs/option overlays",
+        value=True,
+        key="scr_exlev"
+    )
     if ex_lev:
         bad = [
             "3x","2x","-3x","-2x",
-            "2xbull","3xbull","bear -1x",   # NEW edge cases
+            "2xbull","3xbull","bear -1x",
             "leveraged","ultra","inverse","short","bear","etn",
             "covered call","buy-write","option income","option overlay"
         ]
         pat = re.compile("|".join(map(re.escape, bad)))
         screener_df = screener_df[~screener_df["ETF Name"].str.lower().str.contains(pat, na=False)]
-
 
     # Display
     screener_df_display = screener_df[
@@ -1327,7 +1855,7 @@ with tab2:
         "Total Assets": "AUM"
     })
 
-    # NEW: choose columns and download results
+    # choose columns and download results
     available_cols = list(screener_df_display.columns)
     cols_to_show = st.multiselect("Columns to show", available_cols, default=available_cols, key="scr_cols")
     screener_shown = screener_df_display[cols_to_show]
@@ -1340,13 +1868,14 @@ with tab2:
         key="scr_dl"
     )
 
-
+    # Row counts summary
+    final_count = len(screener_shown)
+    st.caption(f"Rows: raw {raw_count:,} → after country {after_country_count:,} → after other filters {final_count:,}")
 
     if screener_df_display.empty:
         st.info("No ETFs match the current filters.")
     else:
         st.dataframe(screener_shown, use_container_width=True)
-
 
 
 # ---- Portfolio Analyzer Tab ----
@@ -1431,7 +1960,19 @@ with tab3:
                 with col5:
                     st.metric("Avg. Dividend Yield", f"{parse_metric('Annual Dividend Yield %').mean():.2f}%")
                 with col6:
-                    st.metric("Avg. AUM (B)", f"{parse_metric('Total Assets').mean():.2f}B")
+                    if "AUM_bil" in merged.columns:
+                        aum_b = pd.to_numeric(merged["AUM_bil"], errors="coerce").mean()
+                    else:
+                        aum_b = pd.to_numeric(
+                            merged["Total Assets"].astype(str)
+                                .str.replace("$","", regex=False)
+                                .str.replace(",","", regex=False)
+                                .str.replace("B","", regex=False),
+                            errors="coerce"
+                        ).mean()
+                    aum_b = 0 if pd.isna(aum_b) else aum_b
+                    st.metric("Avg. AUM (B)", f"{aum_b:.2f}B")
+
 
                 # ---- Portfolio Table ----
                 st.markdown("### Portfolio Breakdown")
@@ -1546,16 +2087,21 @@ with tab4:
                     })
                     current_df["Asset Class"] = current_df["Asset Class"].str.capitalize()
 
-                    # Prepare target portfolio by splitting total target weight across ETFs in that class
-                    target_df = pd.DataFrame([
-                        {"Asset Class": k.capitalize(), "Target Weight (%)": v}
-                        for k, v in normalized_model.items()
-                    ])
+                    # If a model portfolio exists, use its per-ETF target weights
+                    model_df = st.session_state.get("model_df")
+                    if model_df is not None and not model_df.empty:
+                        per_etf_target = (model_df.groupby("Symbol")["Weight %"].sum()
+                                        .rename("Target Weight (%)"))
+                        current_df = current_df.merge(per_etf_target, left_on="ETF", right_index=True, how="left")
 
-                    # Merge target weights into current_df
-                    current_df = current_df.merge(target_df, on="Asset Class", how="left")
+                    # Fallback: split the sleeve target equally across the ETFs you currently hold
+                    missing = current_df["Target Weight (%)"].isna()
+                    if missing.any():
+                        class_target = current_df.loc[missing, "Asset Class"].str.lower().map(normalized_model)  # normalized_model already defined above
+                        counts = current_df.groupby("Asset Class")["ETF"].transform("count").clip(lower=1)
+                        current_df.loc[missing, "Target Weight (%)"] = class_target / counts
 
-                    # Now safely generate rebalancing actions
+                    # Generate actions with correct ETF targets
                     etf_rebalance_result = generate_rebalance_actions(current_df, threshold=drift_thr)
                     st.dataframe(etf_rebalance_result, use_container_width=True)
 
@@ -1741,3 +2287,144 @@ with tab5:
                             st.markdown(f"### {class_name} ETFs — {len(class_df)}")
                             if not class_df.empty:
                                 st.dataframe(class_df[display_cols].sort_values(by="Final Score", ascending=False), use_container_width=True)
+
+# ---- Advisor Notes Assistant Tab ----
+with tab6:
+    st.subheader("📝 Advisor Notes Assistant")
+    country = st.session_state.get("country", "")
+    acct = st.session_state.get("use_context", "")
+
+    # Safety check
+    if 'etf_df' not in globals() or etf_df.empty:
+        st.warning("ETF data is not loaded yet. Please load data first.")
+        st.stop()
+
+    country = st.session_state.get("country", "")
+    acct    = st.session_state.get("use_context", "")
+
+
+
+    # Let the user pick which sleeve to analyze
+    notes_asset_choice = st.selectbox(
+        "Analyze notes for:",
+        ["All", "Equity", "Bonds", "Cash", "Mixed", "Other"],
+        index=0
+    )
+
+    # How many top candidates to scan
+    top_n = st.slider("How many top candidates per sleeve to scan", 3, 20, 8, step=1)
+
+    # Helper to safely build a ranked set for a sleeve without relying on outside variables
+    def _rank_for(ac_label: str) -> pd.DataFrame:
+        return get_ranked_for_class(
+            asset_class=ac_label,
+            goal=goal,
+            risk=risk,
+            country=st.session_state.get("country", ""),
+            account_type=st.session_state.get("use_context", ""),
+            etf_df=etf_df,
+            risk_filters=risk_filters
+        ).head(top_n)
+
+    # Build the DataFrame to annotate
+    if notes_asset_choice == "All":
+        frames = []
+        for ac in ["Equity", "Bonds", "Cash", "Mixed"]:
+            try:
+                df_part = _rank_for(ac)
+                if not df_part.empty:
+                    frames.append(df_part)
+            except Exception:
+                pass
+        candidates_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    else:
+        candidates_df = _rank_for(notes_asset_choice)
+
+    if candidates_df.empty:
+        st.info("No candidates to analyze for notes based on your current filters.")
+        st.stop()
+
+    # Make sure we have the numeric helpers used by your logic
+    if "Yield_clean" not in candidates_df.columns or "ER_clean" not in candidates_df.columns:
+        # Recompute minimal cleans just in case
+        tmp = candidates_df.copy()
+        tmp["Yield_clean"] = pd.to_numeric(
+            tmp["Annual Dividend Yield %"].astype(str).str.replace("%",""), errors="coerce"
+        )
+        tmp["ER_clean"] = pd.to_numeric(
+            tmp["ER"].astype(str).str.replace("%",""), errors="coerce"
+        )
+        # fix 0.05 => 5.0 style inputs
+        if tmp["Yield_clean"].notna().any() and tmp["Yield_clean"].max() <= 1.5:
+            tmp["Yield_clean"] = tmp["Yield_clean"] * 100
+        if tmp["ER_clean"].notna().any() and tmp["ER_clean"].max() <= 1.5:
+            tmp["ER_clean"] = tmp["ER_clean"] * 100
+        candidates_df["Yield_clean"] = tmp["Yield_clean"]
+        candidates_df["ER_clean"] = tmp["ER_clean"]
+
+
+    notes = []
+    for _, r in candidates_df.iterrows():
+        sym = str(r.get("Symbol", "—"))
+        ac  = str(r.get("Simplified Asset Class", "")).lower()
+        lst = str(r.get("Listing Country", "") or "Unknown")
+        yld = float(r.get("Yield_clean", 0) or 0.0)
+        er  = float(r.get("ER_clean", 0) or 0.0)
+
+        this_notes = []
+
+        # Country/account-aware tax hints (simple, readable)
+        if country == "Canada":
+            if acct in {"TFSA", "RESP"}:
+                if lst == "USA" and yld >= 1.0:
+                    this_notes.append("US withholding may make dividends tax-inefficient in TFSA/RESP.")
+            elif acct == "RRSP":
+                if ac == "equity" and lst == "USA":
+                    this_notes.append("US-listed equity dividends are generally treaty-exempt in RRSP.")
+            elif acct == "Non-Registered":
+                if ac == "bond":
+                    this_notes.append("Bond interest is fully taxable in a non-registered account.")
+                if ac == "equity" and yld >= 3.0:
+                    this_notes.append("High dividend yield can increase annual tax drag in taxable.")
+                if ac == "equity" and lst == "Canada":
+                    this_notes.append("Canadian-listed equity may benefit from eligible dividend treatment.")
+        elif country == "USA":
+            if acct in {"Taxable"}:
+                if ac == "bond":
+                    this_notes.append("Bond interest is taxed at ordinary rates in taxable.")
+                if yld >= 3.0:
+                    this_notes.append("High dividend yield can increase annual tax drag in taxable.")
+            elif acct in {"Roth IRA", "Traditional IRA", "401(k)"}:
+                if ac == "equity" and yld <= 1.5:
+                    this_notes.append("Low-yield/growth-tilted equity fits well in tax-advantaged accounts.")
+
+        # General, non-tax hygiene notes
+        if er > 0.50:
+            this_notes.append("Expense ratio is relatively high.")
+        if yld >= 6.0 and ac in {"equity", "mixed"}:
+            this_notes.append("Very high yield — check if it’s an option-overlay or riskier strategy.")
+        if lst == "Unknown":
+            this_notes.append("Listing country unknown — double-check ticker/source.")
+
+        # If we’ve computed Tax Flag/Note in your pipeline, surface it
+        tflag = str(r.get("Tax Flag", "") or "").strip()
+        tnote = str(r.get("TaxEff_note", "") or "").strip()
+        if tflag:
+            this_notes.append(f"Tax flag: {tflag}.")
+        if tnote:
+            this_notes.append(f"Tax note: {tnote}.")
+
+        # Fall-back if nothing triggered
+        if not this_notes:
+            this_notes.append("No major issues flagged.")
+
+        notes.append(f"- **{sym}** — " + " ".join(this_notes))
+
+    st.markdown("### Suggested Advisor Notes")
+    st.markdown("\n".join(notes))
+
+    # Optional: show the table we annotated
+    with st.expander("Show analyzed candidates table"):
+        cols_show = ["Symbol", "ETF Name", "Listing Country", "Simplified Asset Class", "ER", "Annual Dividend Yield %", "Final Score"]
+        cols_show = [c for c in cols_show if c in candidates_df.columns]
+        st.dataframe(candidates_df[cols_show], use_container_width=True)
