@@ -546,9 +546,14 @@ def load_etf_data(
         df["Listing Country"] = df["Listing Country"].where(df["Listing Country"].ne("Unknown"), force_country)
 
     # Safety: if tickers clearly look Canadian (suffix .TO/.TSX/.TSXV/-NE/-CN), correct mislabels
-    cand_pat = re.compile(r'(\.(TO|TSX|TSXV|NE|NEO|CN)|-(NE|CN))$', re.I)
-    mask_can_suffix = df["_SymbolRaw"].astype(str).str.upper().str.contains(cand_pat)
+    # Use non-capturing groups to avoid the pandas "match groups" warning.
+    cand_pat = re.compile(r'(?:\.(?:TO|TSX|TSXV|NE|NEO|CN)|-(?:NE|CN))$', re.I)
+
+    # Be explicit and resilient: treat NaNs as False (na=False)
+    mask_can_suffix = df["_SymbolRaw"].astype(str).str.contains(cand_pat, na=False)
+
     df.loc[mask_can_suffix, "Listing Country"] = "Canada"
+
 
 
     # --- 6) Compute Risk Level and return
@@ -1460,15 +1465,25 @@ with tab1:
 
                 model_df["Price ($)"] = price_series
 
+                # Ensure Dollars/Price/Qty are numeric (handles "", None on Streamlit Cloud)
+                model_df["Dollars"] = pd.to_numeric(model_df["Dollars"], errors="coerce").fillna(0.0)
+                model_df["Price ($)"] = pd.to_numeric(model_df["Price ($)"], errors="coerce").fillna(0.0)
+
                 # Compute whole-share quantities only where price > 0
                 qty_series = pd.to_numeric(
                     (model_df["Dollars"] / model_df["Price ($)"]).where(model_df["Price ($)"] > 0),
                     errors="coerce"
-                ).fillna(0).astype(int)
+                ).fillna(0).astype("Int64")  # nullable integer (safer on Cloud)
 
-                model_df["Qty (whole)"]  = qty_series
-                model_df["Allocated $"]  = (model_df["Qty (whole)"] * model_df["Price ($)"]).round(2)
+                model_df["Qty (whole)"] = qty_series
+
+                # Now multiply with guaranteed numeric dtypes
+                model_df["Allocated $"] = (
+                    model_df["Qty (whole)"].astype("float64") * model_df["Price ($)"].astype("float64")
+                ).round(2)
+
                 model_df["Residual Cash"] = (model_df["Dollars"] - model_df["Allocated $"]).round(2)
+
 
                 # Show a trade-ready table (adds to the earlier table; no need to remove it)
                 st.markdown("### Trade-ready table (with quantities)")
