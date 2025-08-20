@@ -352,7 +352,13 @@ def safe_read_excel(path, sheet):
 
 # ---- Load ETF Data ----
 @st.cache_data
-def load_etf_data(use_new=USE_NEW_DATA, _excel_mtime=None, _csv_mtime=None, _path=None, _sheet=None, _cache_key=None):
+@st.cache_data
+def load_etf_data(
+    use_new=USE_NEW_DATA,
+    _excel_mtime=None, _csv_mtime=None,
+    _path=None, _sheet=None, _cache_key=None,
+    force_country: str | None = None,   # NEW
+):
     """
     Loads ETF data from either the new Excel (preferred) or the legacy CSV,
     and normalizes column names to the legacy schema used throughout the app.
@@ -530,8 +536,19 @@ def load_etf_data(use_new=USE_NEW_DATA, _excel_mtime=None, _csv_mtime=None, _pat
             .str.strip()
         )
 
-    # Final tidy
+
+    # --- Final tidy / country normalization ---
     df["Listing Country"] = df["Listing Country"].fillna("Unknown")
+
+    # If the caller knows which file this came from, prefer that as a fallback
+    if force_country in {"USA", "Canada"}:
+        df["Listing Country"] = df["Listing Country"].replace({"United States": "USA", "US": "USA"})
+        df["Listing Country"] = df["Listing Country"].where(df["Listing Country"].ne("Unknown"), force_country)
+
+    # Safety: if tickers clearly look Canadian (suffix .TO/.TSX/.TSXV/-NE/-CN), correct mislabels
+    cand_pat = re.compile(r'(\.(TO|TSX|TSXV|NE|NEO|CN)|-(NE|CN))$', re.I)
+    mask_can_suffix = df["_SymbolRaw"].astype(str).str.upper().str.contains(cand_pat)
+    df.loc[mask_can_suffix, "Listing Country"] = "Canada"
 
 
     # --- 6) Compute Risk Level and return
@@ -843,18 +860,13 @@ with st.sidebar:
 
 
     # Auto-set the country when a single-region dataset is chosen
-    if dataset_choice == "US ETFs" and st.session_state.get("country","") != "USA":
-        st.session_state["country"] = "USA"
-        st.rerun()
-    elif dataset_choice == "CA ETFs" and st.session_state.get("country","") != "Canada":
-        st.session_state["country"] = "Canada"
-        st.rerun()
-    elif dataset_choice == "All (US+CA)":
-        # Show BOTH countries: clear any country/account filters
-        if st.session_state.get("country","") or st.session_state.get("use_context",""):
-            st.session_state["country"] = ""
-            st.session_state["use_context"] = ""
-            st.rerun()
+    # Do NOT auto-set/clear country based on dataset file.
+    # Country is a user choice that drives Account Type and tax logic.
+    # (All dataset logic below will just read the chosen files.)
+    if dataset_choice == "All (US+CA)":
+        # Optional: do not clear country; user may still want CA/US-specific account types.
+        pass
+
 
         # 2C — quick existence checks (show errors if either file is missing)
         if not os.path.exists(US_DATA_PATH):
@@ -873,6 +885,13 @@ with st.sidebar:
         "Canada": ["", "TFSA", "RRSP", "RESP", "Non-Registered", "Institutional"],
         "USA": ["", "Roth IRA", "401(k)", "Traditional IRA", "Taxable", "Institutional"]
     }
+
+    # Reset account type if the country changed (prevents US choices sticking when switching to Canada, and vice versa)
+    prev_country = st.session_state.get("_prev_country")
+    curr_country = st.session_state.get("country", "")
+    if prev_country != curr_country:
+        st.session_state["use_context"] = ""   # clear previous selection
+    st.session_state["_prev_country"] = curr_country
     
     account_type = st.selectbox(
         "Account Type",
@@ -1046,7 +1065,8 @@ with st.sidebar:
                 _excel_mtime=_mtime(NEW_DATA_PATH),
                 _path=NEW_DATA_PATH,
                 _sheet=NEW_DATA_SHEET,
-                _cache_key=f"US::{_mtime(US_DATA_PATH)}::{US_DATA_SHEET}"
+                _cache_key=f"US::{_mtime(US_DATA_PATH)}::{US_DATA_SHEET}",
+                force_country="USA",
             )
         st.caption("Listing Country counts: " + str(dict(etf_df["Listing Country"].value_counts(dropna=False).to_dict())))
 
@@ -1065,7 +1085,8 @@ with st.sidebar:
                 _excel_mtime=_mtime(NEW_DATA_PATH),
                 _path=NEW_DATA_PATH,
                 _sheet=NEW_DATA_SHEET,
-                _cache_key=f"CA::{_mtime(CA_DATA_PATH)}::{CA_DATA_SHEET}"
+                _cache_key=f"CA::{_mtime(CA_DATA_PATH)}::{CA_DATA_SHEET}",
+                force_country="Canada",
             )
 
 
@@ -1084,7 +1105,8 @@ with st.sidebar:
             _excel_mtime=_mtime(US_DATA_PATH),
             _path=US_DATA_PATH,
             _sheet=US_DATA_SHEET,
-            _cache_key=f"US::{_mtime(US_DATA_PATH)}::{US_DATA_SHEET}"
+            _cache_key=f"US::{_mtime(US_DATA_PATH)}::{US_DATA_SHEET}",
+            force_country="USA",
         )
         st.info(f"US rows loaded: {len(us_df):,}")
 
@@ -1092,7 +1114,8 @@ with st.sidebar:
             _excel_mtime=_mtime(CA_DATA_PATH),
             _path=CA_DATA_PATH,
             _sheet=CA_DATA_SHEET,
-            _cache_key=f"CA::{_mtime(CA_DATA_PATH)}::{CA_DATA_SHEET}"
+            _cache_key=f"CA::{_mtime(CA_DATA_PATH)}::{CA_DATA_SHEET}",
+            force_country="Canada",
         )
         st.info(f"CA rows loaded: {len(ca_df):,}")
 
