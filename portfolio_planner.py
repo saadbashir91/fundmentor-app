@@ -58,6 +58,15 @@ risk_filters = {
     "Growth": ["Medium", "High"]
 }
 
+# Unified asset-class mapping used everywhere
+ASSET_MAP = {
+    "Equity": "equity",
+    "Bonds": "bond",
+    "Cash": "cash",
+    "Mixed": "mixed",
+    "Other": "other",
+}
+
 # ---- Goal Preference Filter ----
 goal_preferences = {
     "Retirement": lambda df: df[pd.to_numeric(df["Annual Dividend Yield %"].str.replace("%", ""), errors="coerce") > 1.8],
@@ -1279,7 +1288,7 @@ with tab1:
                 ranked = keep_one_per_bucket(ranked)
                 if ranked.empty and relax_builder:
                     # Rebuild base set = same asset class, with country/account rules applied
-                    base = etf_df[etf_df["Simplified Asset Class"].str.lower() == asset_mapping[ac]].copy()
+                    base = etf_df[etf_df["Simplified Asset Class"].str.lower() == ASSET_MAP[ac]].copy()
 
                     # Apply country/account policy (same as tabs)
                     policy = get_country_policy(
@@ -1530,18 +1539,11 @@ with tab1:
         "Mixed": tab_mixed,
         "Other": tab_other
     }
-    asset_mapping = {
-        "Equity": "equity",
-        "Bonds": "bond",
-        "Cash": "cash",
-        "Mixed": "mixed",
-        "Other": "other"
-    }
 
     for asset_class, tab in tab_map.items():
         with tab:
             st.markdown(f"### {asset_class} ETF Recommendations")
-            class_key = asset_mapping[asset_class]
+            class_key = ASSET_MAP[asset_class]
 
             # If data isn't loaded, show a friendly note and skip this tab render
             if etf_df.empty:
