@@ -943,7 +943,7 @@ def get_factor_weights(goal):
         return override  # already normalized from the sliders
 
     view = st.session_state.get("builder_view", "Wealth Management")
-    acct = st.session_state.get("use_context", "")
+    acct = st.session_state.get("account_type") or st.session_state.get("use_context", "")
 
     # ---------- Asset Management (institutional) ----------
     if view == "Asset Management":
@@ -1103,7 +1103,7 @@ def rank_etfs(df, goal):
         df = add_account_tax_scores(
             df,
             country=st.session_state.get("country", ""),
-            account_type=st.session_state.get("use_context", "")
+            account_type=st.session_state.get("account_type") or st.session_state.get("use_context", ""),
         )
         df["TaxEff_clean"] = df["TaxEff_account"]
     else:
@@ -1962,6 +1962,7 @@ with tab1:
     limit_sector = st.checkbox("Limit sector/thematic exposure to 50% within Equity", value=True)
     etfs_per_class = st.slider("ETFs per asset class", 1, 3, 1, help="Pick top-N by score within each asset class.")
     min_score = st.slider("Min score to include", 0.00, 1.00, 0.00, 0.05, help="Skip very weak candidates.")
+    st.session_state["min_score"] = float(min_score)
     include_mixed_as_core = st.checkbox("Allow a single Mixed fund to replace Equity/Bonds/Cash if it scores very high", value=False, help="If enabled and a top Mixed ETF scores ≥ chosen threshold, it will be used as a one-ticket core.")
     st.session_state["include_mixed_as_core"] = include_mixed_as_core
 
@@ -3560,9 +3561,9 @@ with tab6:
     # How many top candidates to scan
     top_n = st.slider("How many top candidates per sleeve to scan", 3, 20, 8, step=1)
 
-    # Helper to safely build a ranked set for a sleeve without relying on outside variables
+    # Helper to safely build a ranked set for a sleeve without relying on outside variables    
     def _rank_for(ac_label: str) -> pd.DataFrame:
-        return get_ranked_for_class(
+        ranked = get_ranked_for_class(
             asset_class=ac_label,
             goal=goal,
             risk=risk,
@@ -3570,21 +3571,47 @@ with tab6:
             account_type=st.session_state.get("use_context", ""),
             etf_df=etf_df,
             risk_filters=risk_filters
-        ).head(top_n)
+        ).copy()
 
-    # Build the DataFrame to annotate
-    if notes_asset_choice == "All":
-        frames = []
-        for ac in [k for k in ["Equity", "Bonds", "Cash", "Mixed"] if k in allocation and allocation[k] > 0]:
-            try:
-                df_part = _rank_for(ac)
-                if not df_part.empty:
-                    frames.append(df_part)
-            except Exception:
-                pass
-        candidates_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        # Apply the SAME threshold & uniqueness used by the builder
+        ms = float(st.session_state.get("min_score", 0.0))
+        if "Final Score" in ranked.columns:
+            ranked = ranked[ranked["Final Score"] >= ms]
+
+        # Prevent duplicates tracking the same index (same rule used on build)
+        if callable(globals().get("keep_one_per_bucket")):
+            ranked = keep_one_per_bucket(ranked)
+
+        return ranked.head(top_n)
+    
+    # Build the DataFrame to annotate — prefer actual model picks if available
+    _model = st.session_state.get("model_df")
+    if _model is not None and not _model.empty:
+        # Optional: respect the per‑sleeve dropdown in Notes
+        if notes_asset_choice != "All":
+            _model = _model[_model["Asset Class"] == notes_asset_choice]
+
+        # Bring in full fund metadata for notes logic
+        candidates_df = _model.merge(
+            etf_df.drop_duplicates(subset=["Symbol"]),
+            on="Symbol",
+            how="left"
+        )
     else:
-        candidates_df = _rank_for(notes_asset_choice)
+        # Fall back to ranked candidates if no model has been generated yet
+        if notes_asset_choice == "All":
+            frames = []
+            for ac in [k for k in ["Equity", "Bonds", "Cash", "Mixed"] if k in allocation and allocation[k] > 0]:
+                try:
+                    df_part = _rank_for(ac)
+                    if not df_part.empty:
+                        frames.append(df_part)
+                except Exception:
+                    pass
+            candidates_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        else:
+            candidates_df = _rank_for(notes_asset_choice)
+
 
     if candidates_df.empty:
         st.info("No candidates to analyze for notes based on your current filters.")
