@@ -1644,16 +1644,14 @@ with st.sidebar:
 
     # NEW: How to apply glidepath (radio) – label hidden, disabled if glidepath OFF
     st.radio(
-        "",  # no title text
+        "Glidepath application",
         ["Override base", "Blend 50/50 with base"],
         index=0,
         horizontal=True,
         key="gp_mode",
-        disabled=not st.session_state.get("use_glide", False)
+        disabled=not st.session_state.get("use_glide", False),
+        label_visibility="collapsed",
     )
-
-
-
 
     amount = st.number_input("Investment Amount ($)", min_value=1000, step=1000)
     client_name = st.text_input("Client Name")
