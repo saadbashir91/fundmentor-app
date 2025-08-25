@@ -761,6 +761,45 @@ def load_etf_data(
     df["Yield_num"] = _pct_series(df["Annual Dividend Yield %"], frac_cutoff=1.5)
     df["AUM_bil"]   = df["Total Assets"].apply(_aum_to_billions)
 
+    # --- Risk proxies from existing columns (no API calls) ---
+    def _risk_proxies(df_in: pd.DataFrame) -> pd.DataFrame:
+        """
+        Builds simple risk proxies using columns that commonly exist in your curated files.
+        - Volatility proxy: |Beta (5Y)|  (higher beta ≈ higher volatility)
+        - Drawdown proxy:   worst of [52W Low Chg, ATL Chg (%), ATH Chg (%)] (more negative = worse)
+        - Sharpe proxy:     1Y return divided by volatility proxy (risk-adjusted return)
+        All proxies fall back to NaN and will be scored neutrally if missing.
+        """
+        df_out = df_in.copy()
+
+        # Volatility proxy (abs to avoid signs)
+        if "Beta (5Y)" in df_out.columns:
+            df_out["Risk_Vol_proxy"] = pd.to_numeric(df_out["Beta (5Y)"], errors="coerce").abs()
+        else:
+            df_out["Risk_Vol_proxy"] = np.nan
+
+        # Drawdown proxy: most negative seasonal/ATH/ATL change we can find
+        dd_cols = []
+        for col in ["52W Low Chg", "ATL Chg (%)", "ATH Chg (%)"]:
+            if col in df_out.columns:
+                dd_cols.append(pd.to_numeric(df_out[col], errors="coerce"))
+        if dd_cols:
+            # Take the worst (most negative) across available columns
+            df_out["Risk_Drawdown_proxy"] = pd.concat(dd_cols, axis=1).min(axis=1)
+        else:
+            df_out["Risk_Drawdown_proxy"] = np.nan
+
+        # Sharpe proxy: 1Y % divided by volatility proxy (avoid divide-by-zero)
+        r1y = pd.to_numeric(df_out.get("1Y_num", np.nan), errors="coerce")
+        vol = pd.to_numeric(df_out.get("Risk_Vol_proxy", np.nan), errors="coerce").replace(0, np.nan)
+        df_out["Risk_Sharpe_proxy"] = r1y / vol
+
+        return df_out
+
+    # Build risk proxies now so they’re available downstream
+    df = _risk_proxies(df)
+
+
     # Keep a raw copy for country inference (preserve TSX:, TSXV:, NEO:, etc.)
     df["_SymbolRaw"] = df["Symbol"].astype(str)
 
@@ -932,7 +971,7 @@ def get_factor_weights(goal):
         return {"1Y": 0.10, "ER": 0.25, "AUM": 0.20, "Yield": 0.05, "TaxEff": 0.40}
     # If account not selected yet → use your existing goal-based defaults
     if goal == "Wealth Growth":
-        return {"1Y": 0.30, "ER": 0.20, "AUM": 0.10, "Yield": 0.10, "TaxEff": 0.30}
+        return {"1Y": 0.25, "ER": 0.20, "AUM": 0.10, "Yield": 0.10, "TaxEff": 0.25, "Risk": 0.10}
     elif goal == "Retirement":
         return {"1Y": 0.20, "ER": 0.20, "AUM": 0.10, "Yield": 0.20, "TaxEff": 0.30}
     elif goal == "Income":
@@ -1121,7 +1160,23 @@ def rank_etfs(df, goal):
     )
     base += weights.get("ADV", 0) * df["ADV_score"]
     base += weights.get("Age", 0) * df["Age_score"]
+    # --- Risk-aware add-on (proxies) ---
+    # Normalize: higher Sharpe is good; lower vol/drawdown are good
+    if "Risk_Sharpe_proxy" in df.columns:
+        sharpe_s = normalize(df["Risk_Sharpe_proxy"])
+    else:
+        sharpe_s = pd.Series(0.5, index=df.index)
+
+    vol_s = normalize(-pd.to_numeric(df.get("Risk_Vol_proxy", np.nan), errors="coerce"))
+    dd_s  = normalize(-pd.to_numeric(df.get("Risk_Drawdown_proxy", np.nan), errors="coerce"))
+
+    df["Risk_score"] = (sharpe_s + vol_s + dd_s) / 3.0
+
+    # If the weights include "Risk", blend it; otherwise treat as 0 (no change)
+    base += weights.get("Risk", 0.0) * df["Risk_score"]
+
     df["Final Score"] = base
+    
 
 
     # ★ Apply account-aware tax nudges automatically (no checkbox)    
@@ -1577,6 +1632,29 @@ with st.sidebar:
         "Adjust for time horizon (age-based glidepath)",
         key="use_glide"
     )
+
+    
+    st.checkbox(
+        "Apply guardrails (cap equity by profile & horizon)",
+        value=True,
+        key="apply_glide_guardrails",
+        help="If ON: limit equity by risk-profile cap, short-horizon cap, and retirement-age cap.",
+        disabled=not st.session_state.get("use_glide", False)
+    )
+
+    # NEW: How to apply glidepath (radio) – label hidden, disabled if glidepath OFF
+    st.radio(
+        "",  # no title text
+        ["Override base", "Blend 50/50 with base"],
+        index=0,
+        horizontal=True,
+        key="gp_mode",
+        disabled=not st.session_state.get("use_glide", False)
+    )
+
+
+
+
     amount = st.number_input("Investment Amount ($)", min_value=1000, step=1000)
     client_name = st.text_input("Client Name")
     notes = st.text_area("Meeting Notes")
@@ -1655,18 +1733,33 @@ with st.sidebar:
         st.success("Inputs reset. Re-run your selections.")
         st.rerun()
 
-
+    
     with st.expander("Advanced: scoring weights"):
 
-        w_1y = st.slider("1Y performance", 0.0, 0.6, 0.30 if goal=="Wealth Growth" else 0.20, 0.05, key="w1y")
-        w_er = st.slider("Expense ratio",   0.0, 0.6, 0.20, 0.05, key="wer")
-        w_aum = st.slider("AUM size",       0.0, 0.6, 0.10, 0.05, key="waum")
-        w_yld = st.slider("Dividend yield", 0.0, 0.6, 0.10 if goal=="Wealth Growth" else 0.20, 0.05, key="wyld")
-        w_tax = st.slider("Tax efficiency", 0.0, 0.6, 0.30, 0.05, key="wtax")
-        tot = max(w_1y + w_er + w_aum + w_yld + w_tax, 1e-9)  # normalize
+        w_1y  = st.slider("1Y performance", 0.0, 0.6, 0.30 if goal=="Wealth Growth" else 0.20, 0.05, key="w1y")
+        w_er  = st.slider("Expense ratio",   0.0, 0.6, 0.20, 0.05, key="wer")
+        w_aum = st.slider("AUM size",        0.0, 0.6, 0.10, 0.05, key="waum")
+        w_yld = st.slider("Dividend yield",  0.0, 0.6, 0.10 if goal=="Wealth Growth" else 0.20, 0.05, key="wyld")
+        w_tax = st.slider("Tax efficiency",  0.0, 0.6, 0.30, 0.05, key="wtax")
+
+        # NEW: Risk slider (vol/drawdown/Sharpe proxies)
+        w_risk = st.slider(
+            "Risk (vol/drawdown/Sharpe)",
+            0.0, 0.30, 0.00, 0.01, key="wrisk",
+            help="Turn this up to include risk-adjusted quality in the score."
+        )
+
+        tot = max(w_1y + w_er + w_aum + w_yld + w_tax + w_risk, 1e-9)  # normalize
+
         st.session_state["weights_override"] = {
-            "1Y": w_1y/tot, "ER": w_er/tot, "AUM": w_aum/tot, "Yield": w_yld/tot, "TaxEff": w_tax/tot
+            "1Y":    w_1y  / tot,
+            "ER":    w_er  / tot,
+            "AUM":   w_aum / tot,
+            "Yield": w_yld / tot,
+            "TaxEff":w_tax / tot,
+            "Risk":  w_risk/ tot,    
         }
+
 
     use_account_tax = st.checkbox(
         "Use account-aware tax scoring",
@@ -1777,12 +1870,9 @@ with tab1:
     allocation = base_alloc.copy()
 
     if use_glide:
-        gp_mode = st.radio(
-            "How to apply glidepath",
-            ["Override base", "Blend 50/50 with base"],
-            index=0,
-            horizontal=True
-        )
+        gp_mode = st.session_state.get("gp_mode", "Override base")
+        apply_guardrails = bool(st.session_state.get("apply_glide_guardrails", True))
+
 
         # Equity target from rule of thumb using sidebar Age
         GLIDE_CONST = 120
@@ -1793,20 +1883,24 @@ with tab1:
             eq_target = round(0.5 * eq_target + 0.5 * base_eq, 1)
 
         # Guardrails (risk, short horizon, retirement age)
-        cap_by_risk = {"Conservative": 50, "Balanced": 70, "Growth": 90}
-        reasons = []
-        risk_cap = cap_by_risk.get(risk, 90)
-        if eq_target > risk_cap:
-            reasons.append(f"risk profile cap {risk_cap}%")
-            eq_target = risk_cap
-        if horizon <= 3 and eq_target > 40:
-            reasons.append("short-horizon cap 40%")
-            eq_target = 40
-        if age >= 65 and eq_target > 60:
-            reasons.append("retirement-age cap 60%")
-            eq_target = 60
-        if reasons:
-            st.warning("Glidepath guardrails applied: " + " • ".join(reasons))
+        if apply_guardrails:
+            cap_by_risk = {"Conservative": 50, "Balanced": 70, "Growth": 90}
+            reasons = []
+            risk_cap = cap_by_risk.get(risk, 90)
+            if eq_target > risk_cap:
+                reasons.append(f"risk profile cap {risk_cap}%")
+                eq_target = risk_cap
+            if horizon <= 3 and eq_target > 40:
+                reasons.append("short-horizon cap 40%")
+                eq_target = 40
+            if age >= 65 and eq_target > 60:
+                reasons.append("retirement-age cap 60%")
+                eq_target = 60
+            if reasons:
+                st.warning("Glidepath guardrails applied: " + " • ".join(reasons))
+        else:
+            st.caption("Guardrails OFF for glidepath. Equity target left unconstrained.")
+
 
         # Split remainder across Bonds/Cash in base proportions
         non_eq = 100 - eq_target
@@ -2047,21 +2141,29 @@ with tab1:
             model_df["Weight (%)"] = model_df["Weight %"]
 
             # Use the precomputed, percent-scale helpers if available (preferred)
-            if {"ER_num", "Yield_num"}.issubset(etf_df.columns):
-                meta = etf_df[["Symbol", "ER_num", "Yield_num"]].copy()
+            if {"ER_num", "Yield_num", "1Y_num"}.issubset(etf_df.columns):
+                meta = etf_df[["Symbol", "ER_num", "Yield_num", "1Y_num"]].copy()
             else:
                 # Fallback: parse and normalize once
-                meta = etf_df[["Symbol", "ER", "Annual Dividend Yield %"]].copy()
+                meta = etf_df[["Symbol", "ER", "Annual Dividend Yield %", "1 Year"]].copy()
+
+                # ER → percent units
                 meta["ER_num"] = pd.to_numeric(meta["ER"].astype(str).str.replace("%","", regex=False), errors="coerce")
                 if meta["ER_num"].notna().any() and meta["ER_num"].max() <= 1.5:
                     meta["ER_num"] *= 100
+
+                # Yield → percent units
                 meta["Yield_num"] = pd.to_numeric(meta["Annual Dividend Yield %"].astype(str).str.replace("%","", regex=False), errors="coerce")
                 if meta["Yield_num"].notna().any() and meta["Yield_num"].max() <= 1.5:
                     meta["Yield_num"] *= 100
 
+                # 1Y return → percent units (guard small decimals)
+                meta["1Y_num"] = pd.to_numeric(meta["1 Year"].astype(str).str.replace("%","", regex=False), errors="coerce")
+                if meta["1Y_num"].notna().any() and meta["1Y_num"].max() <= 3.0:
+                    meta["1Y_num"] *= 100
 
             # Merge onto your model
-            model_df = model_df.merge(meta[["Symbol", "ER_num", "Yield_num"]], on="Symbol", how="left")
+            model_df = model_df.merge(meta[["Symbol", "ER_num", "Yield_num", "1Y_num"]], on="Symbol", how="left")
 
             # --- Normalize ER/Yield to % if they were stored as tiny fractions (e.g., 0.0049 = 0.49%) ---
             for col in ["ER_num", "Yield_num"]:
@@ -2093,30 +2195,142 @@ with tab1:
 
             def _badges(row):
                 tags = []
+
+                # 1) Cost / size / history
                 try:
-                    # Low fee: <= 0.10%
                     if float(row.get("ER_num", 9e9)) <= 0.10:
                         tags.append("Low fee")
                 except:
                     pass
                 try:
-                    # Big fund size: AUM >= $5B
                     if float(row.get("AUM_bil", 0)) >= 5:
                         tags.append("Large AUM")
                 except:
                     pass
                 try:
-                    # 3+ years of history
                     if float(row.get("Age_months", 0)) >= 36:
                         tags.append("3yr+ history")
                 except:
                     pass
-                # Home-listed = matches the selected Country in the sidebar
-                if str(row.get("Listing Country","")) == st.session_state.get("country",""):
-                    tags.append("Home-listed")
+
+                # 2) Broad vs Sector/thematic
+                try:
+                    name = str(row.get("ETF Name", ""))
+                    if callable(globals().get("_is_sectorish")) and _is_sectorish(name):
+                        tags.append("Sector/theme")
+                    else:
+                        # If we can bucket the index (e.g., S&P 500, TSX, All-World), call it "Broad exposure"
+                        if callable(globals().get("_index_bucket")):
+                            b = _index_bucket(name)
+                            if b != "other":
+                                tags.append("Broad exposure")
+                except:
+                    pass
+
+                # 3) Income tilt
+                try:
+                    if float(row.get("Yield_num", 0)) >= 3.0:
+                        tags.append("Income tilt")
+                except:
+                    pass
+
+                # 4) Currency hedge hint
+                try:
+                    nm = str(row.get("ETF Name", "")).lower()
+                    if "hedged" in nm:
+                        tags.append("Currency-hedged")
+                except:
+                    pass
+
+                # 5) Account-aware, country-aware hints (TFSA/RRSP friendly)
+                try:
+                    country = st.session_state.get("country", "")
+                    acct    = st.session_state.get("use_context", "")
+                    lst     = str(row.get("Listing Country", "") or "")
+                    ac_key  = str(row.get("Simplified Asset Class", "") or "").lower()
+
+                    if country == "Canada" and ac_key in {"equity","mixed"}:
+                        if acct in {"TFSA","RESP"} and lst == "Canada":
+                            tags.append("TFSA-friendly")
+                        if acct == "RRSP" and lst == "USA":
+                            tags.append("RRSP treaty benefit")
+                except:
+                    pass
+
+                # 6) Home-listed
+                try:
+                    if str(row.get("Listing Country","")) == st.session_state.get("country",""):
+                        tags.append("Home-listed")
+                except:
+                    pass
+
                 return " • ".join(tags)
 
             model_df["Badges"] = model_df.apply(_badges, axis=1)
+
+            # ---- Explainability: Top drivers tags (Excel-only) ----
+            def _norm(s):
+                s = pd.to_numeric(s, errors="coerce")
+                lo, hi = s.min(), s.max()
+                if not np.isfinite(lo) or not np.isfinite(hi) or hi == lo:
+                    return pd.Series(0.5, index=s.index)  # neutral if no spread
+                return (s - lo) / (hi - lo)
+
+            # Use weights from sidebar if present; else default by goal
+            weights = st.session_state.get("weights_override") or get_factor_weights(goal)
+
+            _factors = []  # (key, label, series, weight)
+
+            # 1Y performance (higher is better)
+            if "1Y_num" in model_df.columns and weights.get("1Y", 0) > 0:
+                _factors.append(("1Y", "Recent performance", _norm(model_df["1Y_num"]), weights["1Y"]))
+
+            # Expense ratio (lower is better) -> "Low fee"
+            if "ER_num" in model_df.columns and weights.get("ER", 0) > 0:
+                _factors.append(("ER", "Low fee", _norm(-pd.to_numeric(model_df["ER_num"], errors="coerce")), weights["ER"]))
+
+
+            # AUM (higher is better) -> "Fund size / liquidity"
+            if "AUM_bil" in model_df.columns and weights.get("AUM", 0) > 0:
+                _factors.append(("AUM", "Fund size / liquidity", _norm(model_df["AUM_bil"]), weights["AUM"]))
+
+
+            # Dividend yield (higher is better) -> "Income"
+            if "Yield_num" in model_df.columns and weights.get("Yield", 0) > 0:
+                _factors.append(("Yield", "Income", _norm(model_df["Yield_num"]), weights["Yield"]))
+
+
+            # Tax efficiency proxy (if available) -> "Tax-efficient"
+            if weights.get("TaxEff", 0) > 0:
+                # Always create a Series indexed to model_df, even if the column is missing
+                if "TaxEff_account" in model_df.columns:
+                    tax_series = pd.to_numeric(model_df["TaxEff_account"], errors="coerce")
+                else:
+                    tax_series = pd.Series(np.nan, index=model_df.index)
+
+                if tax_series.isna().all():
+                    tax_series = pd.Series(0.5, index=model_df.index)
+
+                _factors.append(("TaxEff", "Tax-efficient", _norm(tax_series), weights["TaxEff"]))
+
+            # Risk score (if computed) -> "Risk-adjusted quality"
+            if "Risk_score" in model_df.columns and weights.get("Risk", 0) > 0:
+                _factors.append(("Risk", "Risk-adjusted quality", _norm(model_df["Risk_score"]), weights["Risk"]))
+
+            def _drivers_row(i: int) -> str:
+                conts = []
+                for _k, _label, _series, _w in _factors:
+                    try:
+                        val = float(_series.iloc[i])
+                        conts.append((_w * val, _label))
+                    except Exception:
+                        pass
+                conts.sort(reverse=True, key=lambda x: x[0])
+                top = [lbl for _, lbl in conts[:3]]
+                return " • ".join(top)
+
+            model_df["Drivers"] = [ _drivers_row(i) for i in range(len(model_df)) ]
+
 
 
             def _after_tax_yield_factor(listing_country, asset_class_key, country, acct):
@@ -2158,20 +2372,66 @@ with tab1:
 
 
             # Nice column names for display
+
             display_cols = [
                 "Asset Class", "Symbol", "ETF Name",
                 "Weight %", "Dollars",
                 "ER_num", "Yield_num",
                 "Fee $/yr", "Income $/yr",
-                "Score", "Badges"
+                "Score", "Badges", "Drivers"
             ]
 
-            display_renames = {"ER_num": "ER (%)", "Yield_num": "Yield (%)"}
+
+            display_renames = {"ER_num": "ER (%)", "Yield_num": "Yield (%)", "Badges": "Why it ranks", "Drivers": "Top drivers",}
+
+            # Optional: add friendly labels for fields used elsewhere
+            display_renames.update({
+                "AUM_bil": "AUM (B$)",
+                "Age_months": "Age (months)",
+                "Risk_score": "Risk score (0–1)"
+            })
+
 
             st.dataframe(
                 model_df[display_cols].rename(columns=display_renames),
                 use_container_width=True
             )
+
+            # --- Advanced metrics view (pulled from the full dataset by Symbol) ---
+            with st.expander("Show advanced metrics (optional)"):
+                # columns we’ll try to show if present in your excel files
+                extra_cols = [
+                    "AUM_bil", "Age_months", "Beta (5Y)",
+                    "52W Low Chg", "ATH Chg (%)", "ATL Chg (%)",
+                    "Risk_Vol_proxy", "Risk_Drawdown_proxy", "Risk_Sharpe_proxy", "Risk_score"
+                ]
+
+                # Build a compact table: model symbols + the extra metrics from etf_df
+                try:
+                    have = ["Symbol", "ETF Name"] + [c for c in extra_cols if c in etf_df.columns]
+                    adv_df = model_df[["Symbol", "ETF Name"]].merge(
+                        etf_df[have].drop_duplicates(subset=["Symbol","ETF Name"]),
+                        on=["Symbol","ETF Name"],
+                        how="left"
+                    )
+                    # Only show the columns that actually exist
+                    show_cols = [c for c in ["Symbol","ETF Name"] + extra_cols if c in adv_df.columns]
+                    if len(show_cols) > 2:
+                        # Nice headers for a few fields
+                        adv_renames = {
+                            "AUM_bil": "AUM (B$)",
+                            "Age_months": "Age (months)",
+                            "Risk_Vol_proxy": "Volatility proxy (|β 5Y|)",
+                            "Risk_Drawdown_proxy": "Drawdown proxy (worst %)",
+                            "Risk_Sharpe_proxy": "Sharpe proxy",
+                            "Risk_score": "Risk score (0–1)"
+                        }
+                        st.dataframe(adv_df[show_cols].rename(columns=adv_renames), use_container_width=True)
+                    else:
+                        st.caption("No advanced columns available for this selection.")
+                except Exception as e:
+                    st.caption(f"(Could not build advanced metrics table: {e})")
+
 
             st.caption(
                 "Quality gate active: leveraged/inverse excluded unless enabled • "
@@ -2326,8 +2586,15 @@ with tab1:
                 # --- Explain my plan (client-friendly text) ---
     with st.expander("📝 Explain my plan"):
         # Friendly names for factor weights
-        _friendly = {"1Y":"1-year performance","ER":"fees (expense ratio)","AUM":"fund size (AUM)",
-                     "Yield":"dividend yield","TaxEff":"tax efficiency"}
+        _friendly = {
+            "1Y": "1-year performance",
+            "ER": "fees (expense ratio)",
+            "AUM": "fund size (AUM)",
+            "Yield": "dividend yield",
+            "TaxEff": "tax efficiency",
+            "Risk": "risk-adjusted quality"  # NEW
+        }
+
         fw = get_factor_weights(goal)
         top_drivers = " + ".join([_friendly[k] for k, _ in sorted(fw.items(), key=lambda kv: kv[1], reverse=True)[:2]])
 
@@ -2480,6 +2747,77 @@ with tab1:
 
             # Rank strict result
             ranked_df = rank_etfs(filtered_final, goal).sort_values(by="Final Score", ascending=False)
+
+            # --- Unified tab ranking: same as Builder + same relax-if-empty fallback ---
+
+            # Strict pass (identical to the Builder’s normal sleeve scoring)
+            strict_ranked = get_ranked_for_class(
+                asset_class=asset_class,
+                goal=goal,
+                risk=risk,
+                country=st.session_state.get("country",""),
+                account_type=st.session_state.get("use_context",""),
+                etf_df=etf_df,
+                risk_filters=risk_filters
+            )
+
+            ranked_df = strict_ranked.copy()
+            st.caption(f"{len(ranked_df)} ETFs match the current filters.")
+
+            # If strict results are empty, mirror the Builder’s “relax risk if empty” behavior
+            if ranked_df.empty and 'relax_builder' in locals() and relax_builder:
+                st.info("Showing top options with risk relaxed to reach at least 6 results (country/account rules still applied).")
+
+                base = etf_df[etf_df["Simplified Asset Class"].str.lower() == class_key].copy()
+
+                # Apply country/account hard policy (same as Builder fallback)
+                policy = get_country_policy(
+                    st.session_state.get("country",""),
+                    st.session_state.get("use_context",""),
+                    asset_class
+                )
+                if policy["hard_include"]:
+                    base = base[base["Listing Country"].isin(policy["hard_include"])]
+                if policy["hard_exclude"]:
+                    base = base[~base["Listing Country"].isin(policy["hard_exclude"])]
+
+                # Context rules (avoid_us_dividends, favor_growth, etc.) — same as Builder fallback
+                rules = st.session_state.get("use_context_rules") or {}
+                is_equity = (asset_class == "Equity")
+
+                if rules.get("avoid_us_dividends"):
+                    base = base[base["Listing Country"].ne("USA")]
+                if is_equity and rules.get("avoid_dividends"):
+                    base = base[pd.to_numeric(base["Annual Dividend Yield %"].str.replace("%",""), errors="coerce") < 2]
+                if is_equity and rules.get("favor_growth"):
+                    base = base[pd.to_numeric(base["1 Year"].str.replace("%",""), errors="coerce") > 5]
+                if rules.get("favor_low_fee"):
+                    base = base[pd.to_numeric(base["ER"].str.replace("%",""), errors="coerce") < 0.25]
+
+                # Quality/liquidity screens
+                if "AUM_bil" in base.columns:
+                    base = base[pd.to_numeric(base["AUM_bil"], errors="coerce").fillna(0) >= float(st.session_state.get("min_aum_bil", 0.0))]
+                if "Age_months" in base.columns and st.session_state.get("min_age_months", 0) > 0:
+                    base = base[pd.to_numeric(base["Age_months"], errors="coerce").fillna(0) >= int(st.session_state.get("min_age_months", 0))]
+                if st.session_state.get("use_adv") and "Avg Dollar Volume" in base.columns:
+                    base = base[pd.to_numeric(base["Avg Dollar Volume"], errors="coerce").fillna(0) >= st.session_state.get("adv_min", 0)]
+
+                # Keep the equity goal fit (we relax only the Risk-Level screen)
+                if is_equity:
+                    base = safe_goal_filter(base, goal)
+
+                # Score & sort same as Builder
+                ranked_df = rank_etfs(base, goal).sort_values("Final Score", ascending=False)
+
+                # Optional: mark ETFs already in the generated model
+            try:
+                in_model = set(st.session_state.get("model_df", pd.DataFrame()).get("Symbol", []))
+                if in_model:
+                    ranked_df["_in_model"] = ranked_df["Symbol"].isin(in_model)
+                else:
+                    ranked_df["_in_model"] = False
+            except Exception:
+                ranked_df["_in_model"] = False
 
             # --- Ensure a minimum number of recommendations in the tab ---
             MIN_TAB_RESULTS = 6  # change to taste (e.g., 6–10)
@@ -3270,8 +3608,52 @@ with tab6:
         candidates_df["Yield_clean"] = tmp["Yield_clean"]
         candidates_df["ER_clean"] = tmp["ER_clean"]
 
+        # If Age_months is missing, try to compute from Inception Date
+        if "Age_months" not in candidates_df.columns:
+            if "Inception Date" in candidates_df.columns:
+                _inc = pd.to_datetime(candidates_df["Inception Date"], errors="coerce")
+                candidates_df["Age_months"] = ((_inc - _inc.min()).dt.days * 0 +  # keep index
+                                       (pd.Timestamp.today().normalize() - _inc).dt.days / 30.44)
+            else:
+                candidates_df["Age_months"] = np.nan
+
+
+        # If Issuer is missing, derive a simple label from the start of the fund name
+        if "Issuer" not in candidates_df.columns and "ETF Name" in candidates_df.columns:
+            candidates_df["Issuer"] = (
+                candidates_df["ETF Name"]
+                .astype(str)
+                .str.extract(r"^(Vanguard|iShares|SPDR|BMO|Schwab|Invesco|Horizons|BlackRock)", expand=False)
+                .fillna("Other")
+            )
+
+
 
     notes = []
+    # --- Portfolio-level diversification flags (added before per-ETF notes) ---
+    div_flags = []
+
+    # 1) Issuer concentration (by count share of picks)
+    if "Issuer" in candidates_df.columns and not candidates_df.empty:
+        issuer_share = candidates_df["Issuer"].value_counts(normalize=True)
+        if len(issuer_share) > 0:
+            top_issuer = str(issuer_share.index[0])
+            top_share  = float(issuer_share.iloc[0])
+            if top_share >= 0.50 and len(issuer_share) > 1:
+                div_flags.append(f"Concentration: {int(round(top_share*100))}% of picks are from {top_issuer}.")
+
+    # 2) Duplicate index trackers (e.g., multiple S&P 500 funds)
+    if "ETF Name" in candidates_df.columns and callable(globals().get("_index_bucket")):
+        buckets = candidates_df["ETF Name"].apply(_index_bucket)
+        dup = buckets.value_counts()
+        overlapped = [b for b, c in dup.items() if b != "other" and c > 1]
+        if overlapped:
+            div_flags.append("Multiple funds tracking the same index: " + ", ".join(overlapped))
+
+    # Surface portfolio checks at the TOP of the notes list
+    for f in div_flags:
+        notes.append("**Portfolio Check** — " + f)
+
     for _, r in candidates_df.iterrows():
         sym = str(r.get("Symbol", "—"))
         ac  = str(r.get("Simplified Asset Class", "")).lower()
@@ -3280,6 +3662,28 @@ with tab6:
         er  = float(r.get("ER_clean", 0) or 0.0)
 
         this_notes = []
+
+        # --- Behavioral guardrails (ETF-level) ---
+        aum_b = float(r.get("AUM_bil", 0) or 0.0)
+        age_m = float(r.get("Age_months", 0) or 0.0)
+        ret1  = float(r.get("1Y_clean", r.get("1Y_num", 0)) or 0.0)
+
+        # Liquidity / scale
+        if aum_b > 0 and aum_b < 0.05:
+            this_notes.append("⚠️ Low AUM (<$50M) — potential liquidity risk.")
+
+        # Cost
+        if er >= 1.0:
+            this_notes.append("⚠️ High expense ratio (>1.00%).")
+
+        # Track record
+        if age_m and age_m < 12:
+            this_notes.append("⚠️ Limited track record (<12 months).")
+
+        # Chasing momentum
+        if ret1 and ret1 > 80:
+            this_notes.append("🟡 Very high 1Y return — momentum risk; reassess fundamentals.")
+
 
         # Country/account-aware tax hints (simple, readable)
         if country == "Canada":
