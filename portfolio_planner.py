@@ -2143,35 +2143,30 @@ with tab1:
             if {"ER_num", "Yield_num", "1Y_num"}.issubset(etf_df.columns):
                 meta = etf_df[["Symbol", "ER_num", "Yield_num", "1Y_num"]].copy()
             else:
-                # Fallback: parse and normalize once
+                # Fallback: parse and normalize once (percent-safe)
                 meta = etf_df[["Symbol", "ER", "Annual Dividend Yield %", "1 Year"]].copy()
 
-                # ER → percent units
-                meta["ER_num"] = pd.to_numeric(meta["ER"].astype(str).str.replace("%","", regex=False), errors="coerce")
-                if meta["ER_num"].notna().any() and meta["ER_num"].max() <= 1.5:
-                    meta["ER_num"] *= 100
+                def _to_percent_safe(series, small_thr, allow_negative=False):
+                    raw = series.astype(str)
+                    had_pct = raw.str.contains("%", na=False)
+                    # strip the symbol but remember if it was there
+                    vals = pd.to_numeric(raw.str.replace("%", "", regex=False), errors="coerce")
+                    # if no % in the original cell and values are tiny (fractions of 1), scale to percent
+                    # use absolute value for the threshold so negative returns like -0.01 are handled
+                    tiny = vals.abs() <= small_thr if allow_negative else (vals <= small_thr)
+                    vals = np.where((~had_pct) & tiny, vals * 100, vals)
+                    return pd.to_numeric(vals, errors="coerce")
 
-                # Yield → percent units
-                meta["Yield_num"] = pd.to_numeric(meta["Annual Dividend Yield %"].astype(str).str.replace("%","", regex=False), errors="coerce")
-                if meta["Yield_num"].notna().any() and meta["Yield_num"].max() <= 1.5:
-                    meta["Yield_num"] *= 100
-
-                # 1Y return → percent units (guard small decimals)
-                meta["1Y_num"] = pd.to_numeric(meta["1 Year"].astype(str).str.replace("%","", regex=False), errors="coerce")
-                if meta["1Y_num"].notna().any() and meta["1Y_num"].max() <= 3.0:
-                    meta["1Y_num"] *= 100
+                # Expected ranges:
+                #   ER typically < 3%  → treat <=1.5 as “maybe fraction-of-one”
+                #   Yield 1–6% normal → treat <=1.5 as “maybe fraction-of-one”
+                #   1Y return can be +/- → use allow_negative and a looser 3.0 threshold
+                meta["ER_num"]    = _to_percent_safe(meta["ER"],                         small_thr=1.5)
+                meta["Yield_num"] = _to_percent_safe(meta["Annual Dividend Yield %"],    small_thr=1.5)
+                meta["1Y_num"]    = _to_percent_safe(meta["1 Year"],                     small_thr=3.0, allow_negative=True)
 
             # Merge onto your model
             model_df = model_df.merge(meta[["Symbol", "ER_num", "Yield_num", "1Y_num"]], on="Symbol", how="left")
-
-            # --- Normalize ER/Yield to % if they were stored as tiny fractions (e.g., 0.0049 = 0.49%) ---
-            for col in ["ER_num", "Yield_num"]:
-                s = pd.to_numeric(model_df[col], errors="coerce")
-                # If 90% of values are <= 1.5, they were almost certainly fractions of 1 → convert to %
-                if s.notna().sum() and s.dropna().quantile(0.90) <= 1.5:
-                    s = s * 100
-                model_df[col] = s.fillna(0)
-
 
             # Safety: treat missing ER/Yield as 0
             model_df[["ER_num", "Yield_num"]] = model_df[["ER_num", "Yield_num"]].fillna(0)
