@@ -2364,6 +2364,17 @@ with tab1:
                 axis=1
             )
 
+            # Expose the per-row after-tax factor so advisors can see if there is any tax drag
+            model_df["AfterTax_factor"] = model_df.apply(
+                lambda r: _after_tax_yield_factor(
+                    r.get("Listing Country",""),
+                    r.get("Simplified Asset Class",""),
+                    _country, _acct
+                ),
+                axis=1
+            )
+
+
 
             # Nice column names for display
 
@@ -2446,19 +2457,43 @@ with tab1:
                             f"Consider adding broad-market ETFs for diversification."
                         )
 
+
             # ---- Summary metrics ----
             total_fees   = float(model_df["Fee $/yr"].sum())
             total_income = float(model_df["Income $/yr"].sum())
-            weighted_er  = (model_df["ER_num"]   * model_df["Dollars"]).sum() / max(model_df["Dollars"].sum(), 1e-9)
-            weighted_yld = (model_df["Yield_num"]* model_df["Dollars"]).sum() / max(model_df["Dollars"].sum(), 1e-9)
-
             total_after_tax_income = float(model_df["After-tax income $/yr"].sum())
 
+            # Dollar-weighted ER and Yield (already on % scale)
+            weighted_er  = (model_df["ER_num"]    * model_df["Dollars"]).sum() / max(model_df["Dollars"].sum(), 1e-9)
+            weighted_yld = (model_df["Yield_num"] * model_df["Dollars"]).sum() / max(model_df["Dollars"].sum(), 1e-9)
+
+            # Detect if there is any tax effect in this portfolio (any factor != 1.0)
+            has_tax_effect = (pd.to_numeric(model_df["AfterTax_factor"], errors="coerce").round(4) != 1.0).any()
+
             c1, c2, c3, c4 = st.columns(4)
-            with c1: st.metric("Total annual fees",        f"${total_fees:,.2f}")
-            with c2: st.metric("Est. gross income",        f"${total_income:,.2f}")
-            with c3: st.metric("Est. after-tax income",    f"${total_after_tax_income:,.2f}")
-            with c4: st.metric("Weighted ER / Yield",      f"{weighted_er:.2f}% / {weighted_yld:.2f}%")
+            with c1:
+                st.metric("Total annual fees", f"${total_fees:,.2f}")
+            with c2:
+                st.metric("Est. gross income", f"${total_income:,.2f}")
+
+            if has_tax_effect:
+                with c3:
+                    st.metric("Est. after-tax income", f"${total_after_tax_income:,.2f}")
+            else:
+                with c3:
+                    st.metric("Est. after-tax income", f"${total_after_tax_income:,.2f}")
+                    st.caption("Same as gross — current Country/Account implies no tax drag.")
+
+            with c4:
+                st.metric("Weighted ER / Yield", f"{weighted_er:.2f}% / {weighted_yld:.2f}%")
+
+            with st.expander("Tax impact (by position)"):
+                audit = model_df[[
+                    "Asset Class","Symbol","ETF Name","Dollars",
+                    "Yield_num","Income $/yr","AfterTax_factor","After-tax income $/yr"
+                ]].copy()
+                audit.rename(columns={"Yield_num": "Yield (%)"}, inplace=True)
+                st.dataframe(audit, use_container_width=True)
 
             
             st.session_state["model_df"] = model_df  # <— add this line to reuse in the explanation
