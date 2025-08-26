@@ -3640,6 +3640,29 @@ with tab6:
         else:
             candidates_df = _rank_for(notes_asset_choice)
 
+    # --- Ensure Listing Country exists for each candidate (US/Canada) ---
+    # After the merge above, some rows can still be NaN if the symbol didn't match perfectly.
+    # 1) Make sure the column exists
+    if "Listing Country" not in candidates_df.columns:
+        candidates_df["Listing Country"] = np.nan
+
+    # 2) If still missing, infer from the raw ticker suffixes commonly used in Canada
+    #    e.g., XIC.TO / ZAG.TO / HXT.TO / TSX:ZAG / NEO:... / -NE / -CN
+    can_suffix_pat = r'(?:\.(?:TO|TSX|TSXV|NE|NEO|CN)|-(?:NE|CN))$'
+    sym_str = candidates_df["Symbol"].astype(str)
+
+    infer_can = sym_str.str.contains(can_suffix_pat, case=False, regex=True)
+    candidates_df["Listing Country"] = candidates_df["Listing Country"].where(
+        candidates_df["Listing Country"].notna(),
+        np.where(infer_can, "Canada", "USA")
+    )
+
+    # 3) Clean up text variants (just in case)
+    candidates_df["Listing Country"] = (
+        candidates_df["Listing Country"].astype(str)
+        .str.strip()
+        .replace({"United States": "USA", "US": "USA", "U.S.": "USA"})
+    )
 
     if candidates_df.empty:
         st.info("No candidates to analyze for notes based on your current filters.")
