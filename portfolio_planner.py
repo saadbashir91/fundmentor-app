@@ -3160,19 +3160,57 @@ with tab3:
     if uploaded_file is not None:
         user_df = pd.read_csv(uploaded_file)
 
+        # --- Clean the uploaded CSV ---
+        # 1) keep only the columns we know, ignore extras
+        keep_cols = [c for c in ["Symbol", "Quantity", "Price"] if c in user_df.columns]
+        user_df = user_df[keep_cols]
+
+        # 2) normalize symbols (strip spaces, uppercase)
+        user_df["Symbol"] = user_df["Symbol"].astype(str).str.strip().str.upper()
+
+        # 3) combine duplicates (sum Quantity, weighted avg Price if provided)
+        if "Quantity" in user_df.columns:
+            if "Price" in user_df.columns:
+                # Weighted average price: sum(Q*P)/sum(Q)
+                user_df["QxP"] = pd.to_numeric(user_df["Quantity"], errors="coerce") * pd.to_numeric(user_df["Price"], errors="coerce")
+                grouped = user_df.groupby("Symbol", as_index=False).agg({"Quantity":"sum", "QxP":"sum"})
+                grouped["Price"] = (grouped["QxP"] / grouped["Quantity"]).replace([float("inf"), -float("inf")], None)
+                user_df = grouped[["Symbol", "Quantity", "Price"]]
+            else:
+                user_df = user_df.groupby("Symbol", as_index=False)["Quantity"].sum()
+        else:
+            # no quantity: just dedupe symbols
+            user_df = user_df.drop_duplicates(subset=["Symbol"])
+
         if "Symbol" not in user_df.columns:
             st.error("Your file must have a 'Symbol' column with ETF tickers.")
         else:
             # Merge with ETF metadata
             portfolio_df = etf_df[etf_df["Symbol"].isin(user_df["Symbol"])].copy()
 
+            # --- Report symbols not found in our ETF database ---
+            missing_syms = sorted(set(user_df["Symbol"]) - set(portfolio_df["Symbol"]))
+            if missing_syms:
+                st.warning(f"The following symbols were not recognized and were skipped: {', '.join(missing_syms)}")
+
+
             # Merge user data to get Quantity and Price (optional)
             merged = pd.merge(user_df, portfolio_df, on="Symbol", how="inner")
 
             # Handle market value calculation
+            # Try to backfill missing Price from ETF metadata if present
+            if "Price" not in merged.columns or merged["Price"].isna().all():
+                for cand in ["Price_y", "Last", "Close", "NAV", "Last Price", "Prev Close"]:
+                    if cand in merged.columns:
+                        merged["Price"] = pd.to_numeric(merged[cand], errors="coerce")
+                        break
+
             if "Market Value" not in merged.columns:
                 if "Quantity" in merged.columns and "Price" in merged.columns:
-                    merged["Market Value"] = merged["Quantity"] * merged["Price"]
+                    merged["Market Value"] = (
+                        pd.to_numeric(merged["Quantity"], errors="coerce") *
+                        pd.to_numeric(merged["Price"], errors="coerce")
+                    )
                 else:
                     st.warning("To calculate allocation, please provide Quantity and Price in your CSV.")
                     merged["Market Value"] = None
@@ -3182,77 +3220,220 @@ with tab3:
             else:
                 merged["Weight (%)"] = (merged["Market Value"] / merged["Market Value"].sum()) * 100
 
+            allocation_ready = ("Weight (%)" in merged.columns) and merged["Weight (%)"].notna().any()
+
             if merged.empty:
                 st.warning("No matching ETFs found in the dataset.")
             else:
-                col1, col2 = st.columns(2)
-                # --- Concentration metrics ---
-                w_series = pd.to_numeric(merged["Weight (%)"], errors="coerce").fillna(0) / 100.0
-                if not w_series.empty and w_series.sum() > 0:
-                    hhi = float((w_series**2).sum())
-                    top_idx = w_series.idxmax()
-                    top_sym = merged.loc[top_idx, "Symbol"]
-                    top_w   = float(merged.loc[top_idx, "Weight (%)"])
-                    c1, c2 = st.columns(2)
-                    with c1: st.metric("Concentration (HHI)", f"{hhi:.3f}", help="0≈diversified, 1=single position")
-                    with c2: st.metric("Largest position", f"{top_sym} • {top_w:.1f}%")
+                # Only show charts/HHI if Weight (%) exists
+                if allocation_ready:
+                    col1, col2 = st.columns(2)
 
-                with col1:
-                    st.markdown("#### Asset Class Allocation")
-                    asset_counts = merged["Simplified Asset Class"].str.capitalize().value_counts()
-                    fig1, ax1 = plt.subplots(figsize=(2.8, 2.8))
-                    ax1.pie(asset_counts, labels=asset_counts.index, autopct="%1.0f%%", startangle=140, wedgeprops=dict(width=0.4))
-                    st.pyplot(fig1)
+                    # --- Concentration metrics ---
+                    w_series = pd.to_numeric(merged["Weight (%)"], errors="coerce").fillna(0) / 100.0
 
-                with col2:
-                    st.markdown("#### Risk Level Distribution")
-                    risk_counts = merged["Risk Level"].value_counts()
-                    fig2, ax2 = plt.subplots(figsize=(2.8, 2.8))
-                    ax2.pie(risk_counts, labels=risk_counts.index, autopct="%1.0f%%", startangle=140, wedgeprops=dict(width=0.4))
-                    st.pyplot(fig2)
+                    # --- Top 10 holdings bar chart (optional) ---
+                    top = merged.dropna(subset=["Weight (%)"]).copy()
+                    top["WeightNum"] = pd.to_numeric(top["Weight (%)"], errors="coerce")
+                    top = top.nlargest(10, "WeightNum")[["Symbol","WeightNum"]]
+                    if not top.empty:
+                        st.markdown("#### Top 10 Holdings by Weight")
+                        fig, ax = plt.subplots(figsize=(6, 3))
+                        ax.bar(top["Symbol"], top["WeightNum"])
+                        ax.set_ylabel("Weight (%)")
+                        ax.set_xlabel("Symbol")
+                        plt.xticks(rotation=45, ha="right")
+                        st.pyplot(fig)
+
+                    if not w_series.empty and w_series.sum() > 0:
+                        hhi = float((w_series**2).sum())
+                        top_idx = w_series.idxmax()
+                        top_sym = merged.loc[top_idx, "Symbol"]
+                        top_w   = float(merged.loc[top_idx, "Weight (%)"])
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            st.metric("Concentration (HHI)", f"{hhi:.3f}", help="0≈diversified, 1=single position")
+                        with c2:
+                            st.metric("Largest position", f"{top_sym} • {top_w:.1f}%")
+                        
+                        # --- Concentration alerts (simple heuristics) ---
+                        try:
+                            top3_pct = float((w_series.nlargest(3).sum()) * 100.0)
+                        except Exception:
+                            top3_pct = None
+
+                        if top_w > 20:
+                            st.warning(f"Single-position concentration: {top_sym} is {top_w:.1f}% (>20%).")
+                        if top3_pct is not None and top3_pct > 50:
+                            st.warning(f"Top-3 concentration is {top3_pct:.1f}% (>50%). Consider diversifying.")
+
+                        # --- Cash drag nudge (optional) ---
+                        try:
+                            cash_mask = (
+                                merged.get("Simplified Asset Class", pd.Series(index=merged.index, dtype=str))
+                                    .astype(str).str.lower().eq("cash")
+                            )
+                            cash_w = pd.to_numeric(merged.loc[cash_mask, "Weight (%)"], errors="coerce").sum()
+                            if cash_w > 10:
+                                st.info(f"Cash allocation is {cash_w:.1f}%. If this isn't intentional (e.g., waiting to deploy), consider reallocating.")
+                        except Exception:
+                            pass
+
+                        # --- Listing exposure (CAD vs US/Other) by ticker suffix ---
+                        try:
+                            w = pd.to_numeric(merged["Weight (%)"], errors="coerce").fillna(0)   
+                            def _is_cad(sym):
+                                s = str(sym).upper()
+                                return s.endswith((".TO", ".TSX", ".TSXV", ".NE", ".CN"))
+                            cad_w = w[merged["Symbol"].apply(_is_cad)].sum()
+                            other_w = w.sum() - cad_w
+                            st.caption(f"Listing exposure — CAD: {cad_w:.1f}% | US/Other: {other_w:.1f}%")
+                        except Exception:
+                            pass
+
+                    with col1:
+                        st.markdown("#### Asset Class Allocation")
+                        asset_counts = (
+                            merged.get("Simplified Asset Class", pd.Series(dtype=str))
+                                .astype(str).str.capitalize().value_counts()
+                        )
+                        if len(asset_counts) == 0:
+                            st.info("No asset-class data available.")
+                        else:
+                            fig1, ax1 = plt.subplots(figsize=(2.8, 2.8))
+                            ax1.pie(asset_counts, labels=asset_counts.index, autopct="%1.0f%%", startangle=140,
+                                wedgeprops=dict(width=0.4))
+                            st.pyplot(fig1)
+
+                    with col2:
+                        st.markdown("#### Risk Level Distribution")
+                        risk_counts = merged.get("Risk Level", pd.Series(dtype=str)).value_counts()
+                        if len(risk_counts) == 0:
+                            st.info("No risk-level data available.")
+                        else:
+                            fig2, ax2 = plt.subplots(figsize=(2.8, 2.8))
+                            ax2.pie(risk_counts, labels=risk_counts.index, autopct="%1.0f%%", startangle=140,
+                                    wedgeprops=dict(width=0.4))
+                            st.pyplot(fig2)
 
                 # ---- Portfolio Scorecard ----
                 st.markdown("### Portfolio Scorecard")
                 col3, col4, col5, col6 = st.columns(4)
+                def _avg_pct(colname):
+                    if colname in merged.columns:
+                        vals = pd.to_numeric(merged[colname].astype(str).str.replace("%","", regex=False), errors="coerce")
+                        return f"{vals.mean():.2f}%"
+                    return "N/A"
 
-                def parse_metric(col):
-                    if col == "Total Assets":
-                        return pd.to_numeric(
-                            merged[col].astype(str)
-                            .str.replace("$", "", regex=False)
-                            .str.replace("B", "", regex=False)
-                            .str.replace(",", "", regex=False),
-                            errors="coerce"
-                        )
-                    else:
-                        return pd.to_numeric(merged[col].astype(str).str.replace("%", "", regex=False), errors="coerce")
-
-                with col3:
-                    st.metric("Average 1Y Return", f"{parse_metric('1 Year').mean():.2f}%")
-                with col4:
-                    st.metric("Avg. Expense Ratio", f"{parse_metric('ER').mean():.2f}%")
-                with col5:
-                    st.metric("Avg. Dividend Yield", f"{parse_metric('Annual Dividend Yield %').mean():.2f}%")
-                with col6:
+                def _avg_aum_bil():
                     if "AUM_bil" in merged.columns:
                         aum_b = pd.to_numeric(merged["AUM_bil"], errors="coerce").mean()
-                    else:
-                        aum_b = pd.to_numeric(
+                        return f"{(0 if pd.isna(aum_b) else aum_b):.2f}B"
+                    if "Total Assets" in merged.columns:
+                        vals = pd.to_numeric(
                             merged["Total Assets"].astype(str)
-                                .str.replace("$","", regex=False)
-                                .str.replace(",","", regex=False)
-                                .str.replace("B","", regex=False),
+                            .str.replace("$","", regex=False)
+                            .str.replace(",","", regex=False)
+                            .str.replace("B","", regex=False),
                             errors="coerce"
                         ).mean()
-                    aum_b = 0 if pd.isna(aum_b) else aum_b
-                    st.metric("Avg. AUM (B)", f"{aum_b:.2f}B")
+                        return f"{(0 if pd.isna(vals) else vals):.2f}B"
+                    return "N/A"
 
+                with col3:
+                    st.metric("Average 1Y Return", _avg_pct("1 Year"))
+                with col4:
+                    st.metric("Avg. Expense Ratio", _avg_pct("ER"))
+                with col5:
+                    st.metric("Avg. Dividend Yield", _avg_pct("Annual Dividend Yield %"))
+                with col6:
+                    st.metric("Avg. AUM (B)", _avg_aum_bil())
+
+                # --- Portfolio-level weighted metrics ---
+                col7, col8 = st.columns(2)
+
+                def _weighted_pct(colname):
+                    if "Weight (%)" in merged.columns and colname in merged.columns:
+                        w = pd.to_numeric(merged["Weight (%)"], errors="coerce").fillna(0) / 100.0
+                        v = pd.to_numeric(
+                            merged[colname].astype(str).str.replace("%","", regex=False),
+                            errors="coerce"
+                        ) / 100.0
+                        val = (w * v).sum() * 100.0
+                        return None if pd.isna(val) else float(val)
+                    return None
+
+                w_er = _weighted_pct("ER")
+                w_yield = _weighted_pct("Annual Dividend Yield %")
+
+                with col7:
+                    st.metric("Portfolio ER (weighted)", f"{(0 if w_er is None else w_er):.2f}%")
+                with col8:
+                    st.metric("Portfolio Yield (weighted)", f"{(0 if w_yield is None else w_yield):.2f}%")
+
+                # Projected Annual Income in dollars
+                if "Market Value" in merged.columns and "Annual Dividend Yield %" in merged.columns:
+                    mv = pd.to_numeric(merged["Market Value"], errors="coerce")
+                    y  = pd.to_numeric(
+                            merged["Annual Dividend Yield %"].astype(str).str.replace("%","", regex=False),
+                            errors="coerce"
+                        ) / 100.0
+                    income = (mv * y).sum()
+                    if not pd.isna(income):
+                        # show Income and Fees side by side
+                        col9, col10 = st.columns(2)
+                        with col9:
+                            st.metric("Projected Annual Income", f"${income:,.0f}")
+                        with col10:
+                            try:
+                                if w_er is not None and "Market Value" in merged.columns:
+                                    total_mv = pd.to_numeric(merged["Market Value"], errors="coerce").sum()
+                                    fee_dollars = total_mv * (w_er / 100.0)
+                                    st.metric("Est. Annual Fund Fees", f"${fee_dollars:,.0f}")
+                            except Exception:
+                                pass
 
                 # ---- Portfolio Table ----
                 st.markdown("### Portfolio Breakdown")
+                # --- Position flags (fee, size, risk, cash) ---
+                def _num_col(df, col, pct=False, bil=False):
+                    if col not in df.columns:
+                        return pd.Series([pd.NA] * len(df))
+                    s = df[col].astype(str)
+                    if pct:
+                        s = s.str.replace("%", "", regex=False)
+                    if bil:
+                        s = (s.str.replace("$", "", regex=False)
+                            .str.replace(",", "", regex=False)
+                            .str.replace("B", "", regex=False))
+                    return pd.to_numeric(s, errors="coerce")
+
+                er = _num_col(merged, "ER", pct=True)  # percent
+                if "AUM_bil" in merged.columns:
+                    aum_num = pd.to_numeric(merged["AUM_bil"], errors="coerce")  # billions
+                else:
+                    aum_num = _num_col(merged, "Total Assets", bil=True)         # billions (parsed from "$x.xxB")
+                risk = merged.get("Risk Level", pd.Series([""] * len(merged))).astype(str)
+                ac   = merged.get("Simplified Asset Class", pd.Series([""] * len(merged))).astype(str)
+
+                flags = []
+                for i in range(len(merged)):
+                    f = []
+                    if pd.notna(er.iloc[i]) and er.iloc[i] > 0.60:
+                        f.append("High ER")
+                    if pd.notna(aum_num.iloc[i]) and aum_num.iloc[i] < 0.30:
+                        f.append("Small AUM")
+                    if risk.iloc[i].lower() == "high":
+                        f.append("High risk")
+                    if ac.iloc[i].lower() == "cash":
+                        f.append("Cash")
+                    flags.append(" • ".join(f))
+                merged["Flags"] = flags
+
                 display_cols = [
                     "Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", 
-                    "Total Assets", "Simplified Asset Class", "Risk Level", "Market Value", "Weight (%)"
+                    "Total Assets", "Simplified Asset Class", "Risk Level",
+                    "Market Value", "Weight (%)", "Flags"
                 ]
                 display_renames = {
                     "1 Year": "1Y Return",
@@ -3262,8 +3443,86 @@ with tab3:
                     "Simplified Asset Class": "Asset Class"
                 }
 
+                # --- Pretty up for display ---
+                if "Weight (%)" in merged.columns:
+                    merged["Weight (%)"] = pd.to_numeric(merged["Weight (%)"], errors="coerce").round(2)
+                    merged = merged.sort_values(by="Weight (%)", ascending=False)
+
+                # Optional: format Market Value
+                if "Market Value" in merged.columns:
+                    mv = pd.to_numeric(merged["Market Value"], errors="coerce")
+                    merged["Market Value"] = mv
+
+                    # Add totals row (single, safe) — exclude any existing Total rows
+                    base = merged[~merged.get("ETF Name", pd.Series("", index=merged.index)).astype(str).eq("Total")].copy()
+                    totals = {}
+                    if "Market Value" in base.columns:
+                        totals["Market Value"] = pd.to_numeric(base["Market Value"], errors="coerce").sum()
+                    if "Weight (%)" in base.columns:
+                        totals["Weight (%)"] = pd.to_numeric(base["Weight (%)"], errors="coerce").sum()
+
+
+                    if totals:
+                        # build the row using ONLY the fields we actually have values for
+                        total_row = {"Symbol": "—", "ETF Name": "Total"}
+                        total_row.update({k: v for k, v in totals.items() if pd.notna(v)})
+
+                        # (optional) round nicely
+                        if "Weight (%)" in total_row:
+                            total_row["Weight (%)"] = round(float(total_row["Weight (%)"]), 2)
+                        if "Market Value" in total_row:
+                            total_row["Market Value"] = float(total_row["Market Value"])
+
+                        totals_df = pd.DataFrame([total_row])  # no empty columns here → no warning
+                        merged = pd.concat([base, totals_df], ignore_index=True)
+                        if "Flags" in merged.columns:
+                            merged["Flags"] = merged["Flags"].fillna("")
+
+
+
                 existing_cols = [col for col in display_cols if col in merged.columns]
-                st.dataframe(merged[existing_cols].rename(columns=display_renames), use_container_width=True)
+                # --- Format table for display (percents and currency) ---
+                table_df = merged[existing_cols].rename(columns=display_renames).copy()
+                
+                def _to_percent_series(s):
+                    num = pd.to_numeric(s.astype(str).str.replace("%","", regex=False), errors="coerce")
+                    if num.dropna().abs().max() <= 1.0:
+                        num = num * 100.0
+                    return num.apply(lambda x: "" if pd.isna(x) else f"{x:.2f}%")
+
+
+                for col in ["ER", "Annual Dividend Yield %", "1 Year", "1Y Return"]:
+                    if col in table_df.columns:
+                        table_df[col] = _to_percent_series(table_df[col])
+
+                if "Market Value" in table_df.columns:
+                    mv_num = pd.to_numeric(table_df["Market Value"], errors="coerce")
+                    table_df["Market Value"] = mv_num.map(lambda x: f"${x:,.0f}" if pd.notna(x) else "")
+                    # Format AUM as $x.xxB / $x.xxM
+                    if "AUM" in table_df.columns:
+                        aum_num = pd.to_numeric(table_df["AUM"], errors="coerce")
+                        def _fmt_aum(x):
+                            if pd.isna(x): 
+                                return ""
+                            if x >= 1_000_000_000:
+                                return f"${x/1_000_000_000:.2f}B"
+                            if x >= 1_000_000:
+                                return f"${x/1_000_000:.2f}M"
+                            return f"${x:,.0f}"
+                        table_df["AUM"] = aum_num.map(_fmt_aum)
+
+                st.dataframe(table_df, use_container_width=True)
+
+                # --- Download the displayed table as CSV ---
+                _export_df = table_df.copy()
+                csv_bytes = _export_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download Breakdown (CSV)",
+                    data=csv_bytes,
+                    file_name="portfolio_breakdown.csv",
+                    mime="text/csv"
+                )
+
 
 with tab4:
     st.subheader("Rebalancing Checker")
@@ -3649,7 +3908,31 @@ with tab6:
     # 2) If still missing, infer from the raw ticker suffixes commonly used in Canada
     #    e.g., XIC.TO / ZAG.TO / HXT.TO / TSX:ZAG / NEO:... / -NE / -CN
     can_suffix_pat = r'(?:\.(?:TO|TSX|TSXV|NE|NEO|CN)|-(?:NE|CN))$'
-    sym_str = candidates_df["Symbol"].astype(str)
+    # --- Make sure 'Symbol' exists on candidates_df before using it ---
+    if "Symbol" not in candidates_df.columns:
+        # try common alternate names and merge leftovers
+        for alt in ["Ticker", "Ticker Symbol", "ETF", "Fund", "symbol", "ticker", "Symbol_x", "Symbol_y"]:
+            if alt in candidates_df.columns:
+                candidates_df["Symbol"] = candidates_df[alt]
+                break
+
+    # if still missing, try moving the index into a column
+    if "Symbol" not in candidates_df.columns:
+        candidates_df = candidates_df.reset_index()
+        if "Symbol" not in candidates_df.columns and "index" in candidates_df.columns:
+            candidates_df["Symbol"] = candidates_df["index"]
+
+    # final guard: if we STILL don't have Symbol, bail gracefully
+    if "Symbol" not in candidates_df.columns:
+        st.warning("No 'Symbol' column found in ETF candidates; skipping symbol-based step.")
+        sym_str = pd.Series([], dtype=str)
+    else:
+        sym_str = candidates_df["Symbol"].astype(str)
+
+    # normalize and write back
+    sym_str = sym_str.str.strip().str.upper()
+    candidates_df["Symbol"] = sym_str
+
 
     infer_can = sym_str.str.contains(can_suffix_pat, case=False, regex=True)
     candidates_df["Listing Country"] = candidates_df["Listing Country"].where(
