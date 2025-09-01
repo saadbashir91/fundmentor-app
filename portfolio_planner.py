@@ -1416,11 +1416,430 @@ def keep_one_per_bucket(df, name_col="ETF Name", max_per_bucket=1):
     df = df.groupby("_bucket", as_index=False, group_keys=False).head(max_per_bucket)
     return df.drop(columns=["_bucket"], errors="ignore")
 
+# ---- Build a "Recommended" table using Portfolio Builder logic ----
+def build_recommended_table(etf_df, goal, risk, country, account_type):
+    """
+    Returns a single table that stacks the top-ranked candidates for
+    Equity, Bonds, and Cash using the same guardrails & scoring as Portfolio Builder.
+    """
+    # Use your existing engine to produce ranked lists per sleeve
+    parts = []
+    for asset_class in ["Equity", "Bonds", "Cash"]:
+        ranked = get_ranked_for_class(
+            asset_class=asset_class,
+            goal=goal,
+            risk=risk,
+            country=country,
+            account_type=account_type,
+            etf_df=etf_df,
+            risk_filters=risk_filters,
+        )
+
+        # === NEW: apply the SAME post-ranking guards used by Builder ===
+        ms = float(st.session_state.get("min_score", 0.0))
+        if "Final Score" in ranked.columns:
+            ranked = ranked[ranked["Final Score"] >= ms]
+
+        if callable(globals().get("keep_one_per_bucket")):
+            ranked = keep_one_per_bucket(ranked)
+
+        # keep familiar columns and add the sleeve label
+        keep_cols = [c for c in [
+            "Symbol","ETF Name","1 Year","ER","Annual Dividend Yield %","Total Assets",
+            "Risk Level","Listing Country","Final Score"
+        ] if c in ranked.columns]
+        sub = ranked[keep_cols].copy()
+        sub.insert(0, "Asset Class", asset_class)
+
+        # now the “top N” is after gating, just like Builder
+        parts.append(sub.head(10))
+
+    import pandas as pd
+    out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    return out
+
+
+# ---- Helper function to reset screener filters ----
+def reset_screener_filters():
+    st.session_state.update({
+        "scr_asset_class": "All",
+        "scr_risk": "All",
+        "scr_keyword": "",
+        "scr_exlev": True,
+        "scr_country_filter": False,
+    })
+    st.rerun()
+
+    # ---- Initialize screener defaults (only on first run) ----
+    for k, v in {
+        "scr_asset_class": "All",
+        "scr_risk": "All",
+        "scr_keyword": "",
+        "scr_exlev": True,
+        "scr_country_filter": False,
+    }.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+# ========= Guardrails / Notes / Export helpers (Phase 1) =========
+
+from typing import List, Dict
+
+def _first_state(*keys, default=""):
+    """Return the first non-empty value among these session_state keys."""
+    for k in keys:
+        v = st.session_state.get(k)
+        if v is not None and str(v).strip() not in ("", "N/A"):
+            return v
+    return default
+
+def _first_state(*keys, default=""):
+    """Return the first non-empty value among these session_state keys."""
+    for k in keys:
+        v = st.session_state.get(k)
+        if v is not None and str(v).strip() not in ("", "N/A"):
+            return v
+    return default
+
+def _first_state(*keys, default=""):
+    """Return the first non-empty value among these session_state keys."""
+    for k in keys:
+        v = st.session_state.get(k)
+        if v is not None and str(v).strip() not in ("", "N/A"):
+            return v
+    return default
+
+def _first_state(*keys, default=""):
+    for k in keys:
+        v = st.session_state.get(k)
+        if v is not None and str(v).strip() not in ("", "N/A"):
+            return v
+    return default
+
+def _get_context_from_state():
+    return {
+        "client":  _first_state("client_name", "client", "client_full_name", default="Client"),
+        "country": _first_state("country", "listing_country", "residency_country"),
+        "account": _first_state("account_type", "account", "acct_type", "use_context"),
+        "goal":    _first_state("investment_goal", "goal", "client_goal"),
+        "risk":    _first_state("risk_tolerance", "risk_profile", "risk"),
+        "horizon": _first_state("horizon_years", "investment_horizon", "horizon"),
+        "notes":   _first_state("client_notes", "meeting_notes"),  # <- adds meeting notes into context
+    }
+
+def _infer_sleeve(symbol, asset_class):
+    """Map to Equity / Bonds / Cash for sleeve checks."""
+    ac = (asset_class or "").strip().lower()
+    if ac in ("bond", "fixed income", "bonds"):
+        return "Bonds"
+    if ac in ("cash", "t-bill", "money market"):
+        return "Cash"
+    return "Equity"
+
+def _sum_by_sleeve(positions: Dict[str, dict]) -> Dict[str, float]:
+    sleeves = {"Equity":0.0, "Bonds":0.0, "Cash":0.0}
+    for sym, meta in positions.items():
+        sleeves[_infer_sleeve(sym, meta.get("asset_class"))] += float(meta.get("weight",0.0))
+    return sleeves
+
+def _risk_sleeve_targets(risk: str):
+    """Simple default guardrail targets by risk band. Tune if you like."""
+    r = (risk or "").lower()
+    if r in ("conservative",):
+        return {"Equity": (20,40), "Bonds": (50,75), "Cash": (0,20)}
+    if r in ("balanced","moderate"):
+        return {"Equity": (45,65), "Bonds": (25,45), "Cash": (0,15)}
+    if r in ("growth","aggressive","high"):
+        return {"Equity": (70,95), "Bonds": (0,25), "Cash": (0,10)}
+    # default flexible band
+    return {"Equity": (30,80), "Bonds": (10,60), "Cash": (0,20)}
+
+def _lookup_etf_row(etf_df, symbol):
+    try:
+        row = etf_df.loc[etf_df["Symbol"]==symbol].iloc[0]
+        return row
+    except Exception:
+        return None
+
+def run_guardrails_check(positions: Dict[str,dict], etf_df, context: Dict[str,str]) -> List[Dict]:
+    """Return list of {severity, issue, details, fix}."""
+    issues = []
+    total = sum(float(p.get("weight",0.0)) for p in positions.values())
+
+    # --- Totals
+    if total < 99.5:
+        issues.append({"severity":"blocker","issue":"Total weight < 100%","details":f"{total:.1f}%","fix":"Click Normalize to 100%."})
+    if total > 100.5:
+        issues.append({"severity":"blocker","issue":"Total weight > 100%","details":f"{total:.1f}%","fix":"Reduce weights or Normalize to 100%."})
+
+    # --- Concentration
+    for sym, meta in positions.items():
+        w = float(meta.get("weight",0.0))
+        if total > 0:
+            share = 100.0*w/total
+            if share > 60:
+                issues.append({"severity":"warning","issue":"Single-ETF concentration","details":f"{sym} = {share:.1f}% of portfolio","fix":"Reduce position below 60%."})
+
+    # --- Sleeve gaps vs risk profile
+    sleeves = _sum_by_sleeve(positions)
+    bands = _risk_sleeve_targets(context.get("risk",""))
+    for sleeve, (low, high) in bands.items():
+        v = sleeves.get(sleeve,0.0)
+        if v < low:
+            issues.append({"severity":"warning","issue":f"Low {sleeve} sleeve","details":f"{v:.1f}% (target {low}–{high}%)","fix":f"Increase {sleeve} exposure."})
+        if v > high:
+            issues.append({"severity":"warning","issue":f"High {sleeve} sleeve","details":f"{v:.1f}% (target {low}–{high}%)","fix":f"Trim {sleeve} exposure."})
+
+    # --- Instrument quality (AUM, Age) if available
+    for sym, meta in positions.items():
+        row = _lookup_etf_row(etf_df, sym)
+        if row is None: 
+            continue
+        try:
+            aum = float(row.get("Total Assets", 0.0))
+            # thresholds can be account-sensitive; keep simple defaults
+            min_aum = 2e8  # $200M
+            if aum and aum < min_aum:
+                issues.append({"severity":"warning","issue":"Low AUM","details":f"{sym} AUM ${aum:,.0f}","fix":"Prefer > $200M for liquidity."})
+        except Exception:
+            pass
+        # Age in months if you store it
+        if "Age (months)" in etf_df.columns:
+            try:
+                age = float(row.get("Age (months)", 0.0))
+                if age and age < 12:
+                    issues.append({"severity":"warning","issue":"Young fund","details":f"{sym} age {age:.0f} months","fix":"Prefer funds ≥ 12 months."})
+            except Exception:
+                pass
+
+    # --- Account + domicile simple check (TFSA vs US-domiciled equities)
+    acct = (context.get("account","") or "").upper()
+    if acct == "TFSA":
+        for sym, meta in positions.items():
+            row = _lookup_etf_row(etf_df, sym)
+            if row is None: 
+                continue
+            # crude heuristic: Listing Country column, or Symbol suffixes
+            lc = str(row.get("Listing Country",""))
+            if _infer_sleeve(sym, meta.get("asset_class")) == "Equity" and lc == "USA":
+                issues.append({"severity":"blocker","issue":"TFSA foreign withholding drag","details":f"{sym} listed in USA","fix":"Prefer CAD-listed equity ETF for TFSA or move US equity to RRSP."})
+
+    # --- Duplicate index exposure (very light heuristic)
+    # If two ETFs share identical cleaned names like "S&P 500", flag
+    import re as _re
+    def _index_tag(nm:str):
+        nm = (nm or "").lower()
+        # grab a few common index phrases
+        tags = ["s&p 500","total market","msci eafe","aggregate bond","tsx 60","ftse all-world"]
+        for t in tags:
+            if t in nm:
+                return t
+        return ""
+    tag_map = {}
+    for sym, meta in positions.items():
+        row = _lookup_etf_row(etf_df, sym)
+        nm = str(row.get("ETF Name","")) if row is not None else meta.get("name","")
+        tag = _index_tag(nm)
+        if tag:
+            tag_map.setdefault(tag, []).append(sym)
+    for tag, syms in tag_map.items():
+        if len(syms) > 1:
+            issues.append({"severity":"warning","issue":"Duplicate index exposure","details":f"{', '.join(syms)} all track {tag}","fix":"Keep one ETF per index to reduce redundancy."})
+
+    return issues
+
+def draft_advisor_notes(issues: List[Dict], context: Dict[str,str]) -> str:
+    bullets = []
+    bullets.append(f"Client context: Goal={context.get('goal') or 'N/A'}, Risk={context.get('risk') or 'N/A'}, Account={context.get('account') or 'N/A'}, Country={context.get('country') or 'N/A'}")
+    if not issues:
+        bullets.append("• All core guardrails pass. Portfolio appears suitable given the stated profile.")
+    else:
+        # group by severity
+        sev_order = {"blocker":0, "warning":1, "note":2}
+        for it in sorted(issues, key=lambda x: sev_order.get(x.get('severity','note'),2)):
+            prefix = "• "
+            if it["severity"] == "blocker": prefix = "• [BLOCKER] "
+            elif it["severity"] == "warning": prefix = "• [Warning] "
+            bullets.append(f"{prefix}{it['issue']}: {it['details']} — {it['fix']}")
+    bullets.append("• Disclosures: This output is educational and not a recommendation. Review prospectuses and tax specifics before implementation.")
+    return "\n".join(bullets)
+
+# ========= PDF export helpers =========
+from io import BytesIO
+from typing import Dict, List
+
+def _normalize_weights_copy(positions: Dict[str, dict]) -> List[dict]:
+    """Return a list of rows with weights normalized to 100% (for display/export)."""
+    rows = []
+    s = sum(float(p.get("weight", 0.0)) for p in positions.values())
+    for sym, meta in positions.items():
+        w = float(meta.get("weight", 0.0))
+        wn = (w * 100.0 / s) if s > 0 else 0.0
+        rows.append({
+            "Symbol": sym,
+            "ETF Name": meta.get("name", ""),
+            "Asset Class": meta.get("asset_class", ""),
+            "Weight %": round(wn, 2),
+        })
+    return rows
+
+def _pie_png_bytes_from_positions(positions: Dict[str, dict]) -> BytesIO:
+    """Create a normalized pie chart (always sums to 100%) and return PNG bytes."""
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return BytesIO()
+    rows = _normalize_weights_copy(positions)
+    labels = [r["Symbol"] for r in rows]
+    sizes = [r["Weight %"] for r in rows]
+    buf = BytesIO()
+    fig, ax = plt.subplots(figsize=(4, 4))
+    if sizes and sum(sizes) > 0:
+        ax.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=90)
+    ax.axis("equal")
+    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+def generate_pdf_bytes(positions, etf_df, context, notes_text) -> bytes:
+    """
+    Build a one-page client summary PDF:
+    - Logo (if present), title, as-of date
+    - Context line (Goal, Risk, Account, Country, Horizon)
+    - Allocation table (normalized to 100%)
+    - Pie chart (normalized)
+    - Advisor Notes (editable text from app)
+    - Client Meeting Notes (from sidebar)
+    - Disclosure
+    """
+    from io import BytesIO
+    try:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Image, Spacer
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib import colors
+    except Exception as e:
+        return f"ERROR: reportlab not installed ({e}). Run: python -m pip install reportlab".encode()
+
+    # --- Helpers already in your file (assumed): _normalize_weights_copy and _pie_png_bytes_from_positions ---
+    def _fmt(v):
+        s = str(v).strip() if v is not None else ""
+        return s if s else "N/A"
+
+    def _fmt_h(v):
+        try:
+            return f"{int(float(v))} yrs"
+        except Exception:
+            return _fmt(v)
+
+    import datetime as dt
+    styles = getSampleStyleSheet()
+    h1 = styles["Heading1"]
+    h2 = styles["Heading2"]
+    body = styles["BodyText"]
+    small = ParagraphStyle("small", parent=body, fontSize=9, leading=12)
+
+    # Pull context (includes client name + meeting notes if you used the sidebar keys I gave you)
+    client_name   = _fmt(context.get("client") or context.get("client_name") or st.session_state.get("client_name"))
+    goal          = _fmt(context.get("goal"))
+    risk          = _fmt(context.get("risk"))
+    account       = _fmt(context.get("account"))
+    country       = _fmt(context.get("country"))
+    horizon       = _fmt_h(context.get("horizon"))
+    meeting_notes = (context.get("notes") or st.session_state.get("client_notes") or "").strip()
+
+    # Normalize portfolio rows for presentation
+    rows = _normalize_weights_copy(positions)
+
+    # Build pie chart as image
+    pie_buf = _pie_png_bytes_from_positions(positions)
+
+    # Build PDF
+    pdf_buf = BytesIO()
+    doc = SimpleDocTemplate(pdf_buf, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    elems = []
+
+    # Optional logo next to script, if present
+    try:
+        import os
+        logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
+        if os.path.exists(logo_path):
+            elems.append(Image(logo_path, width=120, height=32))
+            elems.append(Spacer(1, 6))
+    except Exception:
+        pass
+
+    # Title + date
+    asof = dt.date.today().strftime("%b %d, %Y")
+    elems.append(Paragraph(f"{client_name} — Portfolio Overview", h1))
+    elems.append(Paragraph(f"As of {asof}", small))
+
+    # Context line
+    ctx_line = (
+        f"Goal: {goal} • Risk: {risk} • Account: {account} • Country: {country} • Horizon: {horizon}"
+    )
+    elems.append(Paragraph(ctx_line, body))
+    elems.append(Spacer(1, 12))
+    elems.append(Paragraph("Weights shown are normalized to 100% for presentation.", small))
+    elems.append(Spacer(1, 10))
+
+    # Allocation section
+    table_data = [["Symbol", "ETF Name", "Sleeve", "Weight %"]]
+    for r in rows:
+        table_data.append([r["Symbol"], r["ETF Name"], r["Asset Class"], f'{r["Weight %"]:.2f}%'])
+
+    tbl = Table(table_data, colWidths=[60, 260, 80, 70])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f3f4f6")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.black),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#d1d5db")),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("ALIGN", (3,1), (3,-1), "RIGHT"),
+        ("VALIGN", (0,0), (-1,-1), "TOP"),
+    ]))
+
+    elems.append(Paragraph("Allocation", h2))
+    elems.append(tbl)
+    elems.append(Spacer(1, 10))
+
+    # Pie chart (normalized)
+    if pie_buf.getbuffer().nbytes > 0:
+        elems.append(Paragraph("Allocation Pie (normalized)", small))
+        elems.append(Image(pie_buf, width=220, height=220))
+        elems.append(Spacer(1, 12))
+
+    # Advisor notes (from the app)
+    elems.append(Paragraph("Advisor Notes", h2))
+    safe_notes = (notes_text or "").replace("\n", "<br/>")
+    elems.append(Paragraph(safe_notes, body))
+    elems.append(Spacer(1, 8))
+
+    # Client Meeting Notes (from sidebar)
+    if meeting_notes:
+        elems.append(Paragraph("Client Meeting Notes", h2))
+        elems.append(Paragraph(meeting_notes.replace("\n", "<br/>"), body))
+        elems.append(Spacer(1, 8))
+
+    # Disclosure
+    elems.append(Paragraph(
+        "Disclosure: This document is educational and not investment advice. "
+        "Review prospectuses and tax specifics before implementation.",
+        small
+    ))
+
+    doc.build(elems)
+    pdf_buf.seek(0)
+    return pdf_buf.read()
+
+
+
 # ---- App Tabs ----
 # ---- Add Custom ETF Lists Tab ----
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Portfolio Builder", "ETF Screener", "Portfolio Analyzer", "Rebalancing Checker", "Custom ETF Lists", "Advisor Notes"
 ])
+
 
 # --- Sidebar: Client Profile ---
 with st.sidebar:
@@ -1656,6 +2075,14 @@ with st.sidebar:
     amount = st.number_input("Investment Amount ($)", min_value=1000, step=1000)
     client_name = st.text_input("Client Name")
     notes = st.text_area("Meeting Notes")
+
+    # --- write client context to session for export / captions ---
+    st.session_state["investment_goal"] = goal
+    st.session_state["risk_tolerance"]  = risk
+    st.session_state["horizon_years"]   = int(horizon)
+    st.session_state["client_name"]     = (client_name or "").strip()
+    st.session_state["client_notes"]    = (notes or "").strip()
+
 
     # --- Advanced: data quality filters (AUM & Fund Age) ---
     with st.expander("Advanced: data quality filters"):
@@ -3033,123 +3460,336 @@ with tab1:
                         use_container_width=True
                     )
 
-# ---- ETF Screener Tab ----
+# ---- ETFs & Sandbox Tab ----
+# ---- ETFs & Sandbox Tab ----
 with tab2:
     st.subheader("ETF Screener")
-    asset_class_options = ["All", "equity", "bond", "cash", "mixed", "other"]
-    selected_asset_class = st.selectbox("Filter by Asset Class", asset_class_options, key="scr_asset_class")
-    risk_options = ["All", "Low", "Medium", "High"]
-    selected_risk = st.selectbox("Filter by Risk Level", risk_options, key="scr_risk")
-    keyword = st.text_input("Search by Symbol or Name", key="scr_keyword")
+    st.caption(
+        "Note: Portfolio Builder applies stricter guardrails (account, country, goal). "
+        "This screener shows the full ETF universe for exploration."
+    )
+        
 
-    # one-click reset for screener filters
-    if st.button("Reset screener filters", key="scr_reset"):
-        st.session_state["scr_asset_class"] = "All"
-        st.session_state["scr_risk"] = "All"
-        st.session_state["scr_keyword"] = ""
-        st.session_state["scr_exlev"] = True
-        st.success("Screener filters reset.")
+    left, right = st.columns([0.64, 0.36])
 
-    # start from master df (MAKE THIS FIRST!)
-    screener_df = etf_df.copy()
-    raw_count = len(screener_df)
+    # ---------------- LEFT: ETF SCREENER ----------------
+    with left:
+        # Filters
+        asset_class_options = ["All", "equity", "bond", "cash", "mixed", "other"]
+        selected_asset_class = st.selectbox(
+            "Filter by Asset Class", asset_class_options, key="scr_asset_class"
+        )
 
-    # Ensure Listing Country exists
-    if "Listing Country" not in screener_df.columns:
-        if "Listing Country" in etf_df.columns:
-            screener_df["Listing Country"] = etf_df["Listing Country"]
+        risk_options = ["All", "Low", "Medium", "High"]
+        selected_risk = st.selectbox(
+            "Filter by Risk Level", risk_options, key="scr_risk"
+        )
+
+        keyword = st.text_input("Search by Symbol or Name", key="scr_keyword")
+
+        # Reset (uses your helper that calls st.rerun)
+        st.button("Reset screener filters", key="scr_reset", on_click=reset_screener_filters)
+
+        # Start from master data
+        screener_df = etf_df.copy()
+        raw_count = len(screener_df)
+
+        # Ensure Listing Country exists
+        if "Listing Country" not in screener_df.columns:
+            if "Listing Country" in etf_df.columns:
+                screener_df["Listing Country"] = etf_df["Listing Country"]
+            else:
+                screener_df["Listing Country"] = screener_df.apply(
+                    lambda r: infer_listing_country(
+                        r.get("Symbol", ""), r.get("ETF Name", ""), r.get("Tags", "")
+                    ),
+                    axis=1,
+                )
+        screener_df["Listing Country"] = screener_df["Listing Country"].fillna("Unknown")
+
+        # Country filter (from sidebar)
+        apply_country_filter = st.checkbox(
+            "Filter by listing country (from sidebar)", value=False, key="scr_country_filter"
+        )
+        country_current = st.session_state.get("country", "")
+        if apply_country_filter and country_current in ("USA", "Canada"):
+            screener_df = screener_df[screener_df["Listing Country"] == country_current]
+            st.caption(f"Active country filter: {country_current}")
         else:
-            screener_df["Listing Country"] = screener_df.apply(
-                lambda r: infer_listing_country(
-                    r.get("Symbol", ""), r.get("ETF Name", ""), r.get("Tags", "")
-                ),
-                axis=1
+            st.caption("Active country filter: All")
+        after_country_count = len(screener_df)
+
+        # Asset class filter
+        if selected_asset_class != "All" and "Simplified Asset Class" in screener_df.columns:
+            screener_df = screener_df[
+                screener_df["Simplified Asset Class"].str.lower() == selected_asset_class.lower()
+            ]
+
+        # Risk filter
+        if selected_risk != "All" and "Risk Level" in screener_df.columns:
+            screener_df = screener_df[screener_df["Risk Level"] == selected_risk]
+
+        # Keyword filter
+        if keyword:
+            screener_df = screener_df[
+                screener_df["ETF Name"].str.contains(keyword, case=False, na=False)
+                | screener_df["Symbol"].str.contains(keyword, case=False, na=False)
+            ]
+
+        # Safety screen
+        ex_lev = st.checkbox(
+            "Exclude leveraged/inverse/ETNs/option overlays", value=True, key="scr_exlev"
+        )
+        if ex_lev:
+            bad = [
+                "3x", "2x", "-3x", "-2x", "2xbull", "3xbull", "bear -1x",
+                "leveraged", "ultra", "inverse", "short", "bear", "etn",
+                "covered call", "buy-write", "option income", "option overlay",
+            ]
+            import re as _re
+            pat = _re.compile("|".join(map(_re.escape, bad)))
+            screener_df = screener_df[
+                ~screener_df["ETF Name"].str.lower().str.contains(pat, na=False)
+            ]
+
+        # Display table (with Add? at far right)
+        base_cols = ["Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", "Total Assets", "Risk Level"]
+        have_cols = [c for c in base_cols if c in screener_df.columns]
+        df_display = screener_df[have_cols].rename(
+            columns={
+                "1 Year": "1Y Return",
+                "ER": "Expense Ratio",
+                "Annual Dividend Yield %": "Yield",
+                "Total Assets": "AUM",
+            }
+        )
+
+        st.caption(
+            f"ETF Screener — rows: raw {raw_count:,} → after country {after_country_count:,} → after other filters {len(df_display):,}"
+        )
+
+        # Build the table with a left-side selector and numbering
+        main_df = df_display.reset_index(drop=True).copy()
+
+        # 1..N numbering (optional; keep if you like it)
+        if "No." not in main_df.columns:
+            main_df.insert(0, "No.", main_df.index + 1)
+
+        # Selection column FIRST so you never need to scroll to the right
+        main_df.insert(0, "Add", False)
+
+        # Control which columns show and their order
+        column_order = [c for c in ["Add", "No.", "Symbol", "ETF Name", "1Y Return", "Expense Ratio", "Yield", "AUM", "Risk Level"] if c in main_df.columns]
+
+        edited_main = st.data_editor(
+            main_df,
+            use_container_width=True,
+            hide_index=True,
+            key="main_editor",
+            height=420,  # gives you a vertical scrollbar
+            column_order=column_order,
+            column_config={
+                "Add": st.column_config.CheckboxColumn(help="Select to add to Sandbox"),
+                "No.": st.column_config.NumberColumn(disabled=True, help="Row number"),
+            },
+        )
+
+        if st.button("Add selected to Sandbox", key="add_selected_main"):
+            # Be defensive in case the column name ever changes
+            add_col = "Add" if "Add" in edited_main.columns else None
+            if not add_col:
+                st.warning("No selection column found.")
+            else:
+                selected_rows = edited_main[edited_main[add_col] == True] if add_col else pd.DataFrame()
+                if selected_rows.empty:
+                    st.info("No ETFs selected. Tick the checkboxes in the left 'Add' column first.")
+                else:
+                    if "sandbox_positions" not in st.session_state:
+                        st.session_state["sandbox_positions"] = {}
+                    store = st.session_state["sandbox_positions"]
+
+                    for _, r in selected_rows.iterrows():
+                        sym = str(r.get("Symbol", "")).strip()
+                        name = str(r.get("ETF Name", "")).strip()
+                        if not sym:
+                            continue
+                        # best-effort lookup for asset class from the filtered frame
+                        ac = ""
+                        try:
+                            ac = str(screener_df.loc[screener_df["Symbol"] == sym, "Simplified Asset Class"].iloc[0])
+                        except Exception:
+                            pass
+
+                        if sym not in store:
+                            store[sym] = {"name": name, "asset_class": ac, "weight": 5.0}
+                        else:
+                            store[sym]["weight"] = min(store[sym]["weight"] + 2.0, 100.0)
+
+                    st.success(f"Added {len(selected_rows)} ETF(s) to Sandbox.")
+
+
+    # ---------------- RIGHT: SANDBOX PORTFOLIO ----------------
+    with right:
+        st.markdown("### Sandbox Portfolio")
+
+        if "sandbox_positions" not in st.session_state:
+            st.session_state["sandbox_positions"] = {}
+
+        positions = st.session_state["sandbox_positions"]
+
+        if not positions:
+            st.caption("No positions yet. Tick ‘Add?’ in the table and click **Add selected**.")
+        else:
+            total_weight = 0.0
+            to_delete = []
+
+            for sym, meta in list(positions.items()):
+                c1, c2, c3 = st.columns([0.36, 0.44, 0.20])
+                with c1:
+                    st.write(f"**{sym}**")
+                    st.caption(meta.get("name", ""))
+                with c2:
+                    meta["weight"] = st.number_input(
+                        "Weight (%)",
+                        min_value=0.0, max_value=100.0, step=0.5,
+                        value=float(meta.get("weight", 0.0)),
+                        key=f"sandbox_w_{sym}",
+                    )
+                with c3:
+                    if st.button("Remove", key=f"rm_{sym}"):
+                        to_delete.append(sym)
+                total_weight += meta.get("weight", 0.0)
+
+            for sym in to_delete:
+                positions.pop(sym, None)
+
+            st.caption(f"Total weight: {total_weight:.1f}%")
+            if total_weight < 99.5 or total_weight > 100.5:
+                st.info("⚠️ Weights should sum to ~100% for a complete portfolio.")
+
+            if positions and st.button("Normalize to 100%"):
+                s = sum(p["weight"] for p in positions.values())
+                if s > 0:
+                    factor = 100.0 / s
+                    for sym in positions:
+                        positions[sym]["weight"] = round(positions[sym]["weight"] * factor, 2)
+                    st.success("Normalized weights to 100%")
+
+            # ---- Context preview (matches what PDF exports) ----
+            ctx = _get_context_from_state()
+            st.caption(
+                f"Context → Goal: {ctx.get('goal') or 'N/A'} • Risk: {ctx.get('risk') or 'N/A'} • "
+                f"Account: {ctx.get('account') or 'N/A'} • Country: {ctx.get('country') or 'N/A'} • "
+                f"Horizon: {ctx.get('horizon') or 'N/A'}"
             )
-    screener_df["Listing Country"] = screener_df["Listing Country"].fillna("Unknown")
-
-    # Single checkbox to apply country filter (uses the sidebar country)
-    apply_country_filter = st.checkbox(
-        "Filter by listing country (from sidebar)",
-        value=False,
-        key="scr_country_filter"
-    )
-
-    # Use the sidebar 'country' value ("USA" / "Canada" / "")
-    country_current = st.session_state.get("country", "")
-    if apply_country_filter and country_current in ("USA", "Canada"):
-        screener_df = screener_df[screener_df["Listing Country"] == country_current]
-        st.caption(f"Active country filter: {country_current}")
-    else:
-        st.caption("Active country filter: All")
 
 
-    after_country_count = len(screener_df)
+            # Simple pie chart
+            try:
+                import matplotlib.pyplot as plt
+                labels = list(positions.keys())
+                sizes = [p["weight"] for p in positions.values()]
+                fig, ax = plt.subplots()
+                ax.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=90)
+                ax.axis("equal")
+                st.pyplot(fig)
+            except Exception:
+                pass
 
+            # ---------------- Guardrails Check + Notes + Export ----------------
+            st.markdown("#### Validate & Export")
 
-    # Asset class filter
-    if selected_asset_class != "All":
-        screener_df = screener_df[
-            screener_df["Simplified Asset Class"].str.lower() == selected_asset_class.lower()
-        ]
+            # 1) Run guardrails
+            if st.button("Run Guardrails Check", key="run_guardrails"):
+                ctx = _get_context_from_state()
+                st.session_state["guardrail_issues"] = run_guardrails_check(positions, etf_df, ctx)
 
-    # Risk filter
-    if selected_risk != "All":
-        screener_df = screener_df[screener_df["Risk Level"] == selected_risk]
+            issues = st.session_state.get("guardrail_issues", [])
 
-    # Keyword search
-    if keyword:
-        screener_df = screener_df[
-            screener_df["ETF Name"].str.contains(keyword, case=False, na=False) |
-            screener_df["Symbol"].str.contains(keyword, case=False, na=False)
-        ]
+            if issues:
+                # simple color map
+                sev_color = {"blocker":"#fde2e2", "warning":"#fff4d6", "note":"#eef2ff"}
+                st.write("**Results**")
+                for it in issues:
+                    bg = sev_color.get(it["severity"], "#eef2ff")
+                    st.markdown(
+                        f"""
+                        <div style="background:{bg};padding:10px;border-radius:10px;margin-bottom:8px;">
+                        <b>{it['issue']}</b><br>
+                        <span style='opacity:.8'>{it['details']}</span><br>
+                        <i>Suggested fix:</i> {it['fix']}
+                        </div>
+                        """, unsafe_allow_html=True
+                    )
+            else:
+                st.caption("No guardrail issues yet. Click **Run Guardrails Check** to evaluate.")
 
-    # Optional safety screen
-    ex_lev = st.checkbox(
-        "Exclude leveraged/inverse/ETNs/option overlays",
-        value=True,
-        key="scr_exlev"
-    )
-    if ex_lev:
-        bad = [
-            "3x","2x","-3x","-2x",
-            "2xbull","3xbull","bear -1x",
-            "leveraged","ultra","inverse","short","bear","etn",
-            "covered call","buy-write","option income","option overlay"
-        ]
-        pat = re.compile("|".join(map(re.escape, bad)))
-        screener_df = screener_df[~screener_df["ETF Name"].str.lower().str.contains(pat, na=False)]
+            # 2) Advisor notes (auto-draft, editable)
+            ctx = _get_context_from_state()
+            default_notes = draft_advisor_notes(issues, ctx)
+            notes_text = st.text_area("Advisor Notes (editable)", value=default_notes, height=180, key="advisor_notes_text")
 
-    # Display
-    screener_df_display = screener_df[
-        ["Symbol", "ETF Name", "1 Year", "ER", "Annual Dividend Yield %", "Total Assets", "Risk Level"]
-    ].rename(columns={
-        "1 Year": "1Y Return",
-        "ER": "Expense Ratio",
-        "Annual Dividend Yield %": "Yield",
-        "Total Assets": "AUM"
-    })
+            # Also pull meeting notes typed in the sidebar (if any)
+            meeting_notes = st.session_state.get("client_notes", "")
 
-    # choose columns and download results
-    available_cols = list(screener_df_display.columns)
-    cols_to_show = st.multiselect("Columns to show", available_cols, default=available_cols, key="scr_cols")
-    screener_shown = screener_df_display[cols_to_show]
+            # 3) Export buttons
+            import io
+            import pandas as pd
 
-    st.download_button(
-        "Download screener results (CSV)",
-        screener_shown.to_csv(index=False).encode(),
-        file_name="screener_results.csv",
-        mime="text/csv",
-        key="scr_dl"
-    )
+            # CSV payload
+            export_df = pd.DataFrame(
+                [
+                    {
+                        "Symbol": s,
+                        "ETF Name": positions[s].get("name",""),
+                        "Weight %": float(positions[s].get("weight",0.0)),
+                        "Asset Class": positions[s].get("asset_class",""),
+                    }
+                    for s in positions
+                ]
+            )
+            csv_bytes = export_df.to_csv(index=False).encode()
 
-    # Row counts summary
-    final_count = len(screener_shown)
-    st.caption(f"Rows: raw {raw_count:,} → after country {after_country_count:,} → after other filters {final_count:,}")
+            colx, coly, colz = st.columns([0.34, 0.33, 0.33])
+            with colx:
+                st.download_button("Export CSV", data=csv_bytes, file_name="sandbox_portfolio.csv", mime="text/csv", key="dl_csv")
+            with coly:
+                st.download_button("Export Notes (TXT)",
+                    data=notes_text.encode(),
+                    file_name="advisor_notes.txt",
+                    mime="text/plain",
+                    key="dl_notes")
+            with colz:
+                # Build PDF on demand (normalized weights inside the PDF)
+                ctx = _get_context_from_state()
+                if positions:
+                    pdf_bytes = generate_pdf_bytes(positions, etf_df, ctx, notes_text)
+                    st.download_button("Export PDF", data=pdf_bytes, file_name="Portfolio_Review.pdf", mime="application/pdf", key="dl_pdf")
+                else:
+                    st.caption("Add ETFs to enable PDF export.")
 
-    if screener_df_display.empty:
-        st.info("No ETFs match the current filters.")
-    else:
-        st.dataframe(screener_shown, use_container_width=True)
+            st.divider()
+            cA, cB = st.columns(2)
+            with cA:
+                st.button("Keep as Sandbox", key="sandbox_keep")
+            with cB:
+                if st.button("Convert to Model Portfolio", key="sandbox_convert"):
+                    import pandas as pd
+                    payload = pd.DataFrame(
+                        [
+                            {
+                                "Symbol": s,
+                                "ETF Name": positions[s].get("name", ""),
+                                "Weight %": float(positions[s].get("weight", 0.0)),
+                                "Asset Class": positions[s].get("asset_class", ""),
+                            }
+                            for s in positions
+                        ]
+                    )
+                    st.session_state["sandbox_model_payload"] = payload
+                    st.success(
+                        "Sandbox converted. Open the Model Portfolios tab to apply guardrails and finalize."
+                    )
 
 
 # ---- Portfolio Analyzer Tab ----
