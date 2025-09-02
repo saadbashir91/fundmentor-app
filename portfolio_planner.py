@@ -7,6 +7,11 @@ import datetime as dt, pathlib  # A1 banner
 import re                       # A4 screener toggle
 from typing import Optional
 
+import urllib.parse
+import json
+import streamlit.components.v1 as components
+
+
 global etf_df, NEW_DATA_PATH, NEW_DATA_SHEET
 
 # ——— SAFETY: make sure the name exists even before loading ———
@@ -924,6 +929,51 @@ def _asof_label(rowcount=None, label="Dataset", ts=None):
         return f"{label} • {ts:%Y-%m-%d %H:%M} • {rows:,} rows"
     return f"{label} • {rows:,} rows"
 
+def _prefill_query(params: dict) -> str:
+    # Build a URL query string safely (skip None/empty)
+    clean = {k: v for k, v in params.items() if v is not None and str(v).strip() != ""}
+    return urllib.parse.urlencode(clean)
+
+def _summarize_portfolio_for_lead():
+    """Create a plain-text summary of the user's current context + picks."""
+    country = st.session_state.get("country", "")
+    account = st.session_state.get("account_type") or st.session_state.get("use_context", "")
+    goal    = st.session_state.get("goal", "")
+    risk    = st.session_state.get("risk", "")
+    alloc   = st.session_state.get("allocation", {})  # dict like {'Equity': 60, ...}
+
+    lines = [
+        f"Country: {country}",
+        f"Account: {account}",
+        f"Goal: {goal}",
+        f"Risk: {risk}",
+        "Allocation targets:",
+    ]
+    if isinstance(alloc, dict):
+        for k, v in alloc.items():
+            try:
+                lines.append(f"  - {k}: {float(v):.0f}%")
+            except Exception:
+                lines.append(f"  - {k}: {v}")
+
+    # Pull model picks if available
+    model = st.session_state.get("model_df")
+    if model is not None and not model.empty:
+        lines.append("Selected ETFs:")
+        try:
+            show_cols = [c for c in ["Symbol","ETF Name","Asset Class","Target Weight (%)"] if c in model.columns]
+            for _, r in model[show_cols].iterrows():
+                sym = str(r.get("Symbol",""))
+                name = str(r.get("ETF Name",""))
+                ac = str(r.get("Asset Class",""))
+                tw = r.get("Target Weight (%)", "")
+                tw_s = f"{float(tw):.1f}%" if str(tw).strip() not in ("","nan","None") else ""
+                lines.append(f"  - {sym} ({ac}) {tw_s} — {name}")
+        except Exception:
+            pass
+
+    return "\n".join(lines)
+
 
 # ---- Multi-Factor ETF Scoring Engine ----
 def normalize(series):
@@ -1833,12 +1883,18 @@ def generate_pdf_bytes(positions, etf_df, context, notes_text) -> bytes:
     return pdf_buf.read()
 
 
-
 # ---- App Tabs ----
 # ---- Add Custom ETF Lists Tab ----
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "Portfolio Builder", "ETF Screener", "Portfolio Analyzer", "Rebalancing Checker", "Custom ETF Lists", "Advisor Notes"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "Portfolio Builder",
+    "ETF Screener",
+    "Portfolio Analyzer",
+    "Rebalancing Checker",
+    "Custom ETF Lists",
+    "Advisor Notes",
+    "Contact an Advisor" 
 ])
+
 
 
 # --- Sidebar: Client Profile ---
@@ -3040,7 +3096,7 @@ with tab1:
             st.info("No qualifying ETFs for the current filters/thresholds.")
 
                 # --- Explain my plan (client-friendly text) ---
-    with st.expander("📝 Explain my plan"):
+    with st.expander("Explain this plan (in plain English)"):
         # Friendly names for factor weights
         _friendly = {
             "1Y": "1-year performance",
@@ -3463,7 +3519,7 @@ with tab1:
 # ---- ETFs & Sandbox Tab ----
 # ---- ETFs & Sandbox Tab ----
 with tab2:
-    st.subheader("ETF Screener")
+    st.subheader("ETF Research & Sandbox")
     st.caption(
         "Note: Portfolio Builder applies stricter guardrails (account, country, goal). "
         "This screener shows the full ETF universe for exploration."
@@ -3519,6 +3575,21 @@ with tab2:
             st.caption("Active country filter: All")
         after_country_count = len(screener_df)
 
+        # Quick filter summary (now that variables exist)
+        _active = []
+        if selected_asset_class != "All":
+            _active.append(f"Asset Class: {selected_asset_class}")
+        if selected_risk != "All":
+            _active.append(f"Risk: {selected_risk}")
+        if keyword:
+            _active.append(f"Search: “{keyword}”")
+        # These two vars are now defined above:
+        if apply_country_filter and country_current in ("USA", "Canada"):
+            _active.append(f"Country: {country_current}")
+
+        summary = " • ".join(_active) if _active else "None"
+        st.caption(f"Active filters: {summary}")
+
         # Asset class filter
         if selected_asset_class != "All" and "Simplified Asset Class" in screener_df.columns:
             screener_df = screener_df[
@@ -3564,6 +3635,27 @@ with tab2:
             }
         )
 
+        # Optional: nicer formatting for table columns
+        import pandas as _pd
+
+        if "AUM" in df_display.columns:
+            aum_num = _pd.to_numeric(df_display["AUM"], errors="coerce")
+            def _fmt_aum(x):
+                if _pd.isna(x): return ""
+                if x >= 1_000_000_000: return f"${x/1_000_000_000:.2f}B"
+                if x >= 1_000_000:     return f"${x/1_000_000:.2f}M"
+                return f"${x:,.0f}"
+            df_display["AUM"] = aum_num.map(_fmt_aum)
+
+        if "Yield" in df_display.columns:
+            y = _pd.to_numeric(df_display["Yield"].astype(str).str.replace("%","", regex=False), errors="coerce")
+            df_display["Yield"] = y.map(lambda v: "" if _pd.isna(v) else f"{v:.2f}%")
+
+        if "1Y Return" in df_display.columns:
+            r = _pd.to_numeric(df_display["1Y Return"].astype(str).str.replace("%","", regex=False), errors="coerce")
+            df_display["1Y Return"] = r.map(lambda v: "" if _pd.isna(v) else f"{v:.2f}%")
+
+
         st.caption(
             f"ETF Screener — rows: raw {raw_count:,} → after country {after_country_count:,} → after other filters {len(df_display):,}"
         )
@@ -3580,6 +3672,31 @@ with tab2:
 
         # Control which columns show and their order
         column_order = [c for c in ["Add", "No.", "Symbol", "ETF Name", "1Y Return", "Expense Ratio", "Yield", "AUM", "Risk Level"] if c in main_df.columns]
+
+        # Optional bulk add of first N visible rows
+        bulk_n = st.number_input("Add first N visible rows", min_value=1, max_value=100, value=10, step=1, key="scr_bulk_n")
+        if st.button("Add first N to Sandbox", key="scr_add_first_n"):
+            if "sandbox_positions" not in st.session_state:
+                st.session_state["sandbox_positions"] = {}
+            store = st.session_state["sandbox_positions"]
+            _take = df_display.head(int(bulk_n))
+            add_count = 0
+            for _, r in _take.iterrows():
+                sym = str(r.get("Symbol", "")).strip()
+                name = str(r.get("ETF Name", "")).strip()
+                if not sym:
+                    continue
+                # best-effort asset class lookup from filtered frame
+                ac = ""
+                try:
+                    ac = str(screener_df.loc[screener_df["Symbol"] == sym, "Simplified Asset Class"].iloc[0])
+                except Exception:
+                    pass
+                if sym not in store:
+                    store[sym] = {"name": name, "asset_class": ac, "weight": 5.0}
+                    add_count += 1
+            st.success(f"Added {add_count} ETF(s) to Sandbox.")
+
 
         edited_main = st.data_editor(
             main_df,
@@ -3631,6 +3748,16 @@ with tab2:
     # ---------------- RIGHT: SANDBOX PORTFOLIO ----------------
     with right:
         st.markdown("### Sandbox Portfolio")
+
+        # Small toolbar for Sandbox
+        col_a, col_b = st.columns([0.5, 0.5])
+        with col_a:
+            st.caption(f"Positions: {len(st.session_state.get('sandbox_positions', {}))}")
+        with col_b:
+            if st.button("Clear Sandbox", key="sandbox_clear"):
+                st.session_state["sandbox_positions"] = {}
+                st.success("Sandbox cleared.")
+                st.rerun()
 
         if "sandbox_positions" not in st.session_state:
             st.session_state["sandbox_positions"] = {}
@@ -4464,7 +4591,7 @@ with tab5:
 
 # ---- Advisor Notes Assistant Tab ----
 with tab6:
-    st.subheader("📝 Advisor Notes Assistant")
+    st.subheader("Advisor Notes Assistant")
     country = st.session_state.get("country", "")
     acct = st.session_state.get("use_context", "")
 
@@ -4741,3 +4868,56 @@ with tab6:
         cols_show = ["Symbol", "ETF Name", "Listing Country", "Simplified Asset Class", "ER", "Annual Dividend Yield %", "Final Score"]
         cols_show = [c for c in cols_show if c in candidates_df.columns]
         st.dataframe(candidates_df[cols_show], use_container_width=True)
+
+# ---- Contact an Advisor Tab ----
+with tab7:
+    st.subheader("Contact an Advisor")
+
+    st.info(
+        "FundMentor provides educational tools only — not investment advice. "
+        "If you’d like to speak with a licensed advisor, share your details below. "
+        "With your consent, we’ll pass your information and a summary of your plan to an affiliate advisor."
+    )
+
+    # Let the user include their current plan details (from session_state/model_df)
+    include_summary = st.checkbox("Include my current plan details (recommended)", value=True)
+    summary_text = _summarize_portfolio_for_lead() if include_summary else ""
+
+    # Show exactly what will be shared (builds trust + increases conversions)
+    if include_summary and summary_text:
+        with st.expander("Preview the plan details we’ll include"):
+            st.code(summary_text, language="text")
+
+    # Optional: quick inline fields (still submit via Google Form)
+    col1, col2 = st.columns(2)
+    with col1:
+        lead_name = st.text_input("Your name (optional)", "")
+    with col2:
+        lead_email = st.text_input("Email (optional)", "")
+
+    # ====== GOOGLE FORMS EMBED ======
+    # 1) Create your Google Form first and copy its "Embed" URL into FORM_BASE.
+    # 2) (Optional) Inspect field IDs (entry.xxxxxxx) to prefill via query params.
+    FORM_BASE = "https://docs.google.com/forms/d/e/1FAIpQLSc5JusOGXYPOkvC4ZrlVqZ3CZb9eHRUFTSy0NHgAJ29ibxlbg/viewform?usp=header"
+
+    # If you mapped your Google Form entry IDs, you can prefill like this.
+    # Replace entry.******** with your real field IDs from the Form.
+    prefill = {
+        # "entry.1111111111": lead_name,
+        # "entry.2222222222": lead_email,
+        # "entry.3333333333": st.session_state.get("country", ""),
+        # "entry.4444444444": st.session_state.get("account_type") or st.session_state.get("use_context",""),
+        # "entry.5555555555": st.session_state.get("goal", ""),
+        # "entry.6666666666": st.session_state.get("risk", ""),
+        # "entry.7777777777": summary_text,
+        # "entry.8888888888": "I consent to share my info with an affiliate advisor."
+    }
+    q = _prefill_query(prefill)
+    form_url = FORM_BASE + (f"?{q}" if q else "")
+
+    components.iframe(src=form_url, height=900)
+
+    st.caption(
+        "By submitting, you consent to share your information with an affiliate advisor who may contact you. "
+        "FundMentor may receive compensation if you engage their services. See our Privacy Policy."
+    )
