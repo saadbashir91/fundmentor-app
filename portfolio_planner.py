@@ -4891,7 +4891,7 @@ with tab7:
     # ====== GOOGLE FORMS EMBED ======
     # Use the Google Forms 'Embed' link. It should look like:
     # https://docs.google.com/forms/d/e/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/viewform?embedded=true
-    FORM_BASE = "https://docs.google.com/forms/d/e/1FAIpQLSfcpY6nTj8RUwjXm5JHjG-CKkfmXFe_RUsJqC2KDhVtMTVPWw/viewform?embedded=true"
+    FORM_BASE = "https://docs.google.com/forms/d/e/1FAIpQLSdFyMBxtB6ephtBFr05f_AAyEQzVyPo7kCsrCL31dkTWv-_RQ/viewform?usp=header"
 
     # (Optional) If later you decide to prefill fields, you can build a query string and append it.
     # For now, keep it empty so the form stays short and clean.
@@ -4903,3 +4903,4 @@ with tab7:
         "By submitting, you consent to share your information with an affiliate advisor who may contact you. "
         "FundMentor may receive compensation if you engage their services. See our Privacy Policy."
     )
+
