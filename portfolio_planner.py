@@ -4870,50 +4870,32 @@ with tab6:
         st.dataframe(candidates_df[cols_show], use_container_width=True)
 
 # ---- Contact an Advisor Tab ----
+# ---- Contact an Advisor Tab ----
 with tab7:
     st.subheader("Contact an Advisor")
 
     st.info(
         "FundMentor provides educational tools only — not investment advice. "
-        "If you’d like to speak with a licensed advisor, share your details below. "
-        "With your consent, we’ll pass your information and a summary of your plan to an affiliate advisor."
+        "If you’d like to speak with a licensed advisor, share your contact details and your goal below. "
+        "With your consent, we’ll forward your request to an affiliate advisor."
     )
 
-    # Let the user include their current plan details (from session_state/model_df)
-    include_summary = st.checkbox("Include my current plan details (recommended)", value=True)
-    summary_text = _summarize_portfolio_for_lead() if include_summary else ""
+    # Simple encouragement (no plan preview, no extra fields here)
+    st.markdown(
+        "🎉 **Congratulations — you’re one step closer to achieving your financial goals.**  \n"
+        "Once you submit, an advisor will review your goal and reach out to guide you with tailored recommendations.  \n"
+        "We only connect you with licensed professionals you can trust, offering guidance that’s personalized to you, with absolutely no obligation."
+)
 
-    # Show exactly what will be shared (builds trust + increases conversions)
-    if include_summary and summary_text:
-        with st.expander("Preview the plan details we’ll include"):
-            st.code(summary_text, language="text")
-
-    # Optional: quick inline fields (still submit via Google Form)
-    col1, col2 = st.columns(2)
-    with col1:
-        lead_name = st.text_input("Your name (optional)", "")
-    with col2:
-        lead_email = st.text_input("Email (optional)", "")
 
     # ====== GOOGLE FORMS EMBED ======
-    # 1) Create your Google Form first and copy its "Embed" URL into FORM_BASE.
-    # 2) (Optional) Inspect field IDs (entry.xxxxxxx) to prefill via query params.
-    FORM_BASE = "https://docs.google.com/forms/d/e/1FAIpQLSdFyMBxtB6ephtBFr05f_AAyEQzVyPo7kCsrCL31dkTWv-_RQ/viewform?usp=header"
+    # Use the Google Forms 'Embed' link. It should look like:
+    # https://docs.google.com/forms/d/e/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/viewform?embedded=true
+    FORM_BASE = "https://docs.google.com/forms/d/e/1FAIpQLSfcpY6nTj8RUwjXm5JHjG-CKkfmXFe_RUsJqC2KDhVtMTVPWw/viewform?embedded=true"
 
-    # If you mapped your Google Form entry IDs, you can prefill like this.
-    # Replace entry.******** with your real field IDs from the Form.
-    prefill = {
-        # "entry.1111111111": lead_name,
-        # "entry.2222222222": lead_email,
-        # "entry.3333333333": st.session_state.get("country", ""),
-        # "entry.4444444444": st.session_state.get("account_type") or st.session_state.get("use_context",""),
-        # "entry.5555555555": st.session_state.get("goal", ""),
-        # "entry.6666666666": st.session_state.get("risk", ""),
-        # "entry.7777777777": summary_text,
-        # "entry.8888888888": "I consent to share my info with an affiliate advisor."
-    }
-    q = _prefill_query(prefill)
-    form_url = FORM_BASE + (f"?{q}" if q else "")
+    # (Optional) If later you decide to prefill fields, you can build a query string and append it.
+    # For now, keep it empty so the form stays short and clean.
+    form_url = FORM_BASE
 
     components.iframe(src=form_url, height=900)
 
@@ -4921,4 +4903,3 @@ with tab7:
         "By submitting, you consent to share your information with an affiliate advisor who may contact you. "
         "FundMentor may receive compensation if you engage their services. See our Privacy Policy."
     )
-
