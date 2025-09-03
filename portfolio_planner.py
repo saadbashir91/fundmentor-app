@@ -1887,7 +1887,7 @@ def generate_pdf_bytes(positions, etf_df, context, notes_text) -> bytes:
 # ---- Add Custom ETF Lists Tab ----
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Portfolio Builder",
-    "ETF Screener",
+    "Sandbox Portfolio",
     "Portfolio Analyzer",
     "Rebalancing Checker",
     "Custom ETF Lists",
@@ -3517,7 +3517,6 @@ with tab1:
                     )
 
 # ---- ETFs & Sandbox Tab ----
-# ---- ETFs & Sandbox Tab ----
 with tab2:
     st.subheader("ETF Research & Sandbox")
     st.caption(
@@ -4891,7 +4890,7 @@ with tab7:
     # ====== GOOGLE FORMS EMBED ======
     # Use the Google Forms 'Embed' link. It should look like:
     # https://docs.google.com/forms/d/e/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/viewform?embedded=true
-    FORM_BASE = "https://docs.google.com/forms/d/e/1FAIpQLSdFyMBxtB6ephtBFr05f_AAyEQzVyPo7kCsrCL31dkTWv-_RQ/viewform?usp=header"
+    FORM_BASE = "https://docs.google.com/forms/d/e/1FAIpQLSfcpY6nTj8RUwjXm5JHjG-CKkfmXFe_RUsJqC2KDhVtMTVPWw/viewform?embedded=true"
 
     # (Optional) If later you decide to prefill fields, you can build a query string and append it.
     # For now, keep it empty so the form stays short and clean.
@@ -4903,4 +4902,3 @@ with tab7:
         "By submitting, you consent to share your information with an affiliate advisor who may contact you. "
         "FundMentor may receive compensation if you engage their services. See our Privacy Policy."
     )
-
